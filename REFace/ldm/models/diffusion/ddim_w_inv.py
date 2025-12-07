@@ -288,7 +288,7 @@ class DDIMSampler(object):
         # switch off pnp injection
         register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1", chunks=3)
         #pnp feature transfer    
-        register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1", chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="fft",split_ratio_fft=0.8,alpha=0.0)
+        register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1", chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="fft",split_ratio_fft=0.8,alpha=0.8)
         # register_conv_injection(self, 1) 
         # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1", chunks=3,block_indices=[6,7],fusion="temporal")
         # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=False, output_blocks=False,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3],fusion="flow_fix")
@@ -300,12 +300,12 @@ class DDIMSampler(object):
         for i, step in enumerate(iterator):
             
             if True:
-                register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.0)
+                register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.8)
                 # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[8],fusion="flow_fix")
-                register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=False, output_blocks=False,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.0)
+                register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=False, output_blocks=False,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.8)
             else:
-                register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=False, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.0)    
-                register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="fft",split_ratio_fft=0.8,alpha=0.0)
+                register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=False, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.8)    
+                register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="fft",split_ratio_fft=0.8,alpha=0.8)
             # if i==total_steps//2:
                 # register_spa_attn_injection(self, 1,switch_on=False,input_blocks=False,output_blocks=True,attn_component="attn1")
                 # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,output_blocks=False,attn_component="attn1")
