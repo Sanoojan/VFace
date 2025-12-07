@@ -1,7 +1,4 @@
-import argparse, os, sys, glob
-
-#set cuda device 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+import argparse, os, sys
 import cv2
 import torch
 import numpy as np
@@ -26,38 +23,21 @@ import torchvision.transforms as transforms
 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 from moviepy.editor import AudioFileClip, VideoFileClip
 import proglog
-
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
-
 from src.utils.alignmengt import crop_faces, calc_alignment_coefficients, crop_faces_from_image
-
-# from ldm.data.test_bench_dataset import COCOImageDataset
-# from ldm.data.test_bench_dataset import CelebAdataset,FFHQdataset
 from ldm.data.video_swap_dataset import VideoDataset
-# import clip
 from torchvision.transforms import Resize
 import torchvision.transforms.functional as TF 
-import torchvision.transforms as transforms
-import torch.nn.functional as F
-
 from PIL import Image
 from torchvision.transforms import PILToTensor
-
-
 from pretrained.face_parsing.face_parsing_demo import init_faceParsing_pretrained_model, faceParsing_demo, vis_parsing_maps
-# from dift.src.models.dift_sd import SDFeaturizer
-# from dift.src.utils.visualization import Demo
-
-
-# import matplotlib.pyplot as plt
-import torch.nn as nn
-
+import torch.nn as nn 
+import yaml
+from glob import glob
 from scripts.face_swap_utils import *
-
-# cos = nn.CosineSimilarity(dim=0)
-import numpy as np  
 from scripts.temporal_flow import *
+import torchvision.transforms as transforms
 
 # load safety model
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
@@ -200,8 +180,6 @@ def un_norm_clip(x1):
 def un_norm(x):
     return (x+1.0)/2.0
 
-
-
 def save_clip_img(img, path,clip=True):
     if clip:
         img=un_norm_clip(img)
@@ -211,6 +189,485 @@ def save_clip_img(img, path,clip=True):
     img = (img * 255).astype(np.uint8)
     img = Image.fromarray(img)
     img.save(path)
+
+def run_inference(model, sampler, opt, device, config):
+    os.makedirs(opt.outdir, exist_ok=True)
+    outpath = opt.outdir
+    Base_path=opt.Base_dir
+
+    batch_size = opt.n_samples
+    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
+    if not opt.from_file:
+        prompt = opt.prompt
+        assert prompt is not None
+        data = [batch_size * [prompt]]
+
+    else:
+        print(f"reading prompts from {opt.from_file}")
+        with open(opt.from_file, "r") as f:
+            data = f.read().splitlines()
+            data = list(chunk(data, batch_size))
+
+    # sample_path = os.path.join(outpath, "samples")
+    result_path = os.path.join(outpath, "results")
+    model_out_path = os.path.join(outpath, "model_outputs")
+    target_video_name=os.path.basename(opt.target_video).split('.')[0]
+    src_name=os.path.basename(opt.src_image).split('.')[0]
+    
+    target_frames_path=os.path.join(Base_path, target_video_name)
+    target_cropped_face_path=os.path.join(Base_path, target_video_name+"cropped_face")
+    mask_frames_path=os.path.join(Base_path, target_video_name+"mask_frames")
+    # os.makedirs(sample_path, exist_ok=True)
+    os.makedirs(result_path, exist_ok=True)
+    os.makedirs(target_frames_path, exist_ok=True)
+    os.makedirs(mask_frames_path, exist_ok=True)
+    os.makedirs(target_cropped_face_path, exist_ok=True)
+    os.makedirs(model_out_path, exist_ok=True)
+    out_video_filepath=os.path.join(outpath, target_video_name+'to'+src_name+'_swap.mp4')
+    
+    video_forcheck = VideoFileClip(opt.target_video)
+
+    if video_forcheck.audio is None:
+        no_audio = True
+    else:
+        no_audio = False
+
+    del video_forcheck
+
+    if not no_audio:
+        video_audio_clip = AudioFileClip(opt.target_video)
+    
+    video = cv2.VideoCapture(opt.target_video)
+    # video_shape
+    video_shape = (int(video.get(cv2.CAP_PROP_FRAME_WIDTH)), int(video.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    temp_results_dir = os.path.join(outpath, 'temp_results')
+    inverse_results_dir=os.path.join(opt.Base_dir, 'inverse_results')
+    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    # fps = video.get(cv2.CAP_PROP_FPS)
+    fps=10
+    os.makedirs(temp_results_dir, exist_ok=True)
+    os.makedirs(inverse_results_dir, exist_ok=True)
+    
+    faceParsing_model = init_faceParsing_pretrained_model(opt.faceParser_name, opt.faceParsing_ckpt, opt.segnext_config)
+    
+    
+    crops, orig_images, quads, inv_transforms = crop_and_align_face([opt.src_image])
+    crops = [crop.convert("RGB") for crop in crops]
+    T = crops[0]
+    src_image_new=os.path.join(temp_results_dir, src_name+'.png')
+    T.save(src_image_new)
+
+    
+    # src_image=cv2.imread(opt.src_image)
+    pil_im = Image.open(src_image_new).convert("RGB").resize((1024,1024), Image.BILINEAR)
+    mask = faceParsing_demo(faceParsing_model, pil_im, convert_to_seg12=opt.seg12, model_name=opt.faceParser_name)
+    Image.fromarray(mask).save(os.path.join(temp_results_dir, os.path.basename(opt.src_image)))
+
+    
+    # get count of mask_frames_path
+    base_count = len(os.listdir(target_frames_path))
+    mask_count= len(os.listdir(mask_frames_path))
+    
+    frame_count = opt.n_frames
+    
+    
+    if base_count != frame_count or mask_count != frame_count :
+        inv_transforms_all = []
+        
+        for frame_index in tqdm(range(frame_count)):
+            ret, frame = video.read() 
+            # if frame_index <1088:
+            #     continue
+            if ret:
+                try:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_old = frame
+                    Image.fromarray(frame).save(os.path.join(target_frames_path, f'{frame_index}.png'))
+                    crops, orig_images, quads, inv_transforms = crop_and_align_face([os.path.join(target_frames_path, f'{frame_index}.png')])
+                    
+                    crops = [crop.convert("RGB") for crop in crops]
+                    T = crops[0]
+                    inv_transforms_all.append(inv_transforms[0])
+                    
+                    pil_im = T.resize((1024,1024), Image.BILINEAR)
+                    mask = faceParsing_demo(faceParsing_model, pil_im, convert_to_seg12=opt.seg12, model_name=opt.faceParser_name)
+                    Image.fromarray(mask).save(os.path.join(mask_frames_path, f'{frame_index}.png'))
+                    # save T
+                    T.save(os.path.join(target_cropped_face_path, f'{frame_index}.png'))
+                except:
+                    Image.fromarray(frame_old).save(os.path.join(target_frames_path, f'{frame_index}.png'))
+                    inv_transforms_all.append(inv_transforms[0])
+                    Image.fromarray(mask).save(os.path.join(mask_frames_path, f'{frame_index}.png'))
+                    # save T
+                    T.save(os.path.join(target_cropped_face_path, f'{frame_index}.png'))
+                    print('error finding face at', frame_index)
+                    pass
+        # save inv_transforms_all
+        np.save(os.path.join(Base_path,  target_video_name+'_inv_transforms.npy'), inv_transforms_all)
+        
+    # load inv_transforms_all
+    inv_transforms_all=np.load(os.path.join(Base_path,  target_video_name+'_inv_transforms.npy'), allow_pickle=True)
+    video.release()
+    del faceParsing_model
+    
+    
+    ################### Get reference
+    conf_file=OmegaConf.load(opt.config)
+    trans=A.Compose([
+            A.Resize(height=224,width=224)])
+    ref_img_path = src_image_new
+    img_p_np=cv2.imread(ref_img_path)
+    # ref_img = Image.open(ref_img_path).convert('RGB').resize((224,224))
+    ref_img = cv2.cvtColor(img_p_np, cv2.COLOR_BGR2RGB)
+    # ref_img= cv2.resize(ref_img, (224, 224))
+    
+    ref_mask_path = os.path.join(temp_results_dir, os.path.basename(opt.src_image))
+    ref_mask_img = Image.open(ref_mask_path).convert('L')
+    ref_mask_img = np.array(ref_mask_img)  # Convert the label to a NumPy array if it's not already
+
+    # Create a mask to preserve values in the 'preserve' list
+    # preserve = [1,2,4,5,8,9,17 ]
+    preserve = conf_file.data.params.test.params['preserve_mask_src_FFHQ']
+    # preserve = [1,2,4,5,8,9 ]
+    ref_mask= np.isin(ref_mask_img, preserve)
+
+    # Create a converted_mask where preserved values are set to 255
+    ref_converted_mask = np.zeros_like(ref_mask_img)
+    ref_converted_mask[ref_mask] = 255
+    ref_converted_mask=Image.fromarray(ref_converted_mask).convert('L')
+    # convert to PIL image
+    
+    #Gray Mask
+    reference_mask_tensor=get_tensor(normalize=False, toTensor=True)(ref_converted_mask)
+    mask_ref=transforms.Resize((224,224))(reference_mask_tensor)
+    ref_img=trans(image=ref_img)
+    ref_img=Image.fromarray(ref_img["image"])
+    ref_img=get_tensor_clip()(ref_img)
+    ref_img=ref_img*mask_ref
+    ref_image_tensor = ref_img.to(device,non_blocking=True).to(torch.float16).unsqueeze(0)
+    
+    ######## Src Reconstruction ###########
+    ref_img_inv_ori=Image.open(ref_img_path).convert("RGB").resize((512,512), Image.BILINEAR)
+    ref_img_inv_ori = get_tensor()(ref_img_inv_ori)
+    ref_img_inv_ori= ref_img_inv_ori*reference_mask_tensor
+    
+    ref_img_inv_ori_inpaint=ref_img_inv_ori.clone()
+    ref_img_inv_ori_inpaint=ref_img_inv_ori_inpaint*(1-reference_mask_tensor)
+    #######################################
+    
+    
+    #Black_mask
+    # ref_mask_img=Image.fromarray(ref_img).convert('L')
+    # ref_mask_img_r = ref_converted_mask.resize(img_p_np.shape[1::-1], Image.NEAREST)
+    # ref_mask_img_r = np.array(ref_mask_img_r)
+    # ref_img[ref_mask_img_r==0]=0
+    # ref_img=trans(image=ref_img)
+    # ref_img=Image.fromarray(ref_img["image"])
+    # ref_img=get_tensor_clip()(ref_img)
+    # ref_image_tensor = ref_img.to(device,non_blocking=True).to(torch.float16).unsqueeze(0)
+    ########################
+    
+
+    test_args=conf_file.data.params.test.params
+    
+    
+    
+    
+    test_dataset=VideoDataset(data_path=target_cropped_face_path,mask_path=mask_frames_path,**test_args)
+    test_dataloader= torch.utils.data.DataLoader(test_dataset, 
+                                        batch_size=batch_size, 
+                                        num_workers=4, 
+                                        pin_memory=True, 
+                                        shuffle=False,#sampler=train_sampler, 
+                                        drop_last=True)
+
+
+
+
+
+    start_code = None
+    if opt.fixed_code:
+        print("Using fixed code.......")
+        start_code1= torch.randn([ opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
+        # extend the start code to batch size
+        start_code1 = start_code1.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+
+   
+    
+    use_prior=False
+    use_ddim_inversion=True
+    
+    precision_scope = autocast if opt.precision=="autocast" else nullcontext
+    sample=0
+    
+    
+    # cond_only_once=False
+
+    
+    with torch.no_grad():
+        with precision_scope("cuda"):
+            with model.ema_scope():
+                all_samples = list()
+  
+  
+                for batch_id, (test_batch,prior, test_model_kwargs,segment_id_batch) in enumerate(test_dataloader):
+                    sample+=opt.n_samples
+                    # if sample<980:
+                    #     continue
+                    # breakpoint()
+                    
+                        
+                    test_model_kwargs={n:test_model_kwargs[n].to(device,non_blocking=True) for n in test_model_kwargs }
+                    uc = None
+                    if opt.scale != 1.0:
+                        uc = model.learnable_vector.repeat(test_batch.shape[0],1,1)
+                        if model.stack_feat:
+                            uc2=model.other_learnable_vector.repeat(test_batch.shape[0],1,1)
+                            uc=torch.cat([uc,uc2],dim=-1)
+                    
+                    # c = model.get_learned_conditioning(test_model_kwargs['ref_imgs'].squeeze(1).to(torch.float16))
+                    landmarks=model.get_landmarks(test_batch) if model.Landmark_cond else None
+                    ref_imgs=ref_image_tensor
+                    # stack it ref_imgs to the shape of test_batch
+                    ref_imgs=ref_imgs.repeat(test_batch.shape[0],1,1,1)
+                    
+                    ##############  Src Reconstruction ##########
+                    ref_img_inv=ref_img_inv_ori
+                    landmarks_src=model.get_landmarks(ref_img_inv.unsqueeze(0)) 
+                    cond_w_src=model.conditioning_with_feat(ref_imgs[0].unsqueeze(0).to(torch.float32),landmarks=landmarks_src,tar=ref_img_inv.unsqueeze(0).to("cuda").to(torch.float32)).float()
+                    cond_w_src=cond_w_src.repeat(test_batch.shape[0],1,1)
+                    ############################
+                    
+                    
+                    c=model.conditioning_with_feat(ref_imgs.squeeze(1).to(torch.float32),landmarks=landmarks,tar=test_batch.to("cuda").to(torch.float32)).float()
+                    if (model.land_mark_id_seperate_layers or model.sep_head_att) and opt.scale != 1.0:
+            
+                        # concat c, landmarks
+                        landmarks=landmarks.unsqueeze(1) if len(landmarks.shape)!=3 else landmarks
+                        uc=torch.cat([uc,landmarks],dim=-1)
+                    
+                    
+                    if c.shape[-1]==1024:
+                        c = model.proj_out(c)
+                    if len(c.shape)==2:
+                        c = c.unsqueeze(1)
+                    inpaint_image=test_model_kwargs['inpaint_image']
+                    inpaint_mask=test_model_kwargs['inpaint_mask']
+                    z_inpaint = model.encode_first_stage(test_model_kwargs['inpaint_image'])
+                    z_inpaint = model.get_first_stage_encoding(z_inpaint).detach()
+                    test_model_kwargs['inpaint_image']=z_inpaint
+                    test_model_kwargs['inpaint_mask']=Resize([z_inpaint.shape[-1],z_inpaint.shape[-1]])(test_model_kwargs['inpaint_mask'])
+
+                    ######## Src Reconstruction ###########
+                    inpaint_mask_src=1-reference_mask_tensor
+                    inpaint_image_src=ref_img_inv_ori_inpaint
+                    inpaint_image_src=inpaint_image_src.unsqueeze(0).to(device)
+                    z_inpaint_src = model.encode_first_stage(inpaint_image_src)
+                    z_inpaint_src = model.get_first_stage_encoding(z_inpaint_src).detach()
+                    inpaint_image_src=z_inpaint_src
+                    inpaint_mask_src=Resize([z_inpaint_src.shape[-1],z_inpaint_src.shape[-1]])(inpaint_mask_src)
+                    #######################################
+                    
+                    
+                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                    inverse_cond=None
+                    
+                    if opt.Start_from_target:
+                        print("Starting from target....")
+                        x=test_batch
+                        x=x.to(device)
+                        encoder_posterior = model.encode_first_stage(x)
+                        z = model.get_first_stage_encoding(encoder_posterior)
+                        
+                        
+                        t=int(opt.target_start_noise_t)
+                        # t = torch.ones((x.shape[0],), device=device).long()*t
+                        t = torch.randint(t-1, t, (x.shape[0],), device=device).long()
+                    
+                        if use_ddim_inversion:
+                            prior=prior.to(device)
+                            encoder_posterior_2=model.encode_first_stage(prior)
+                            z2 = model.get_first_stage_encoding(encoder_posterior_2)
+                            test_batch_clip=test_batch
+                            test_batch_clip=test_batch_clip.to(device)
+                            test_batch_clip=test_batch_clip*(1-inpaint_mask)
+                            test_batch_clip=un_norm(test_batch_clip)
+                            test_batch_clip=Resize([224,224])(test_batch_clip)
+                            test_batch_clip=TF.normalize(test_batch_clip, [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
+                            
+                            # visualize ref_imgs
+
+                            inverse_cond=model.conditioning_with_feat(test_batch_clip.to(torch.float32),landmarks=landmarks,tar=test_batch.to("cuda").to(torch.float32)).float()
+                            
+                            inverse_steps=50
+                            inverse_results_dir_for_batch=os.path.join(inverse_results_dir, str(batch_id))
+                            prior=prior.to(device)
+                            encoder_posterior_2=model.encode_first_stage(prior)
+                            z2 = model.get_first_stage_encoding(encoder_posterior_2)
+                            
+                            ######## Src Reconstruction ###########
+                            ref_img_inv=ref_img_inv.repeat(test_batch.shape[0],1,1,1)
+                            ref_img_inv=ref_img_inv.to(device)
+                            encoder_posterior_ref=model.encode_first_stage(ref_img_inv)
+                            z_ref = model.get_first_stage_encoding(encoder_posterior_ref)
+                            z2_tar=z2
+                            z2=torch.cat([z2_tar,z_ref],dim=0)
+                            inverse_cond_inv=torch.cat([inverse_cond,cond_w_src],dim=0)
+                            test_model_kwargs_inv=test_model_kwargs.copy()
+                            
+                            
+                            # test_model_kwargs_inv['inpaint_image']=torch.cat([test_model_kwargs['inpaint_image'],test_model_kwargs['inpaint_image']],dim=0)  # just checking
+                            # test_model_kwargs_inv['inpaint_mask']=torch.cat([test_model_kwargs['inpaint_mask'],test_model_kwargs['inpaint_mask']],dim=0)  # just checking
+                            
+                            inpaint_image_src=inpaint_image_src.repeat(test_batch.shape[0],1,1,1)
+                            inpaint_mask_src=inpaint_mask_src.repeat(test_batch.shape[0],1,1,1).to(device)
+                            test_model_kwargs_inv['inpaint_image']=torch.cat([test_model_kwargs['inpaint_image'],inpaint_image_src ],dim=0)  # just checking
+                            test_model_kwargs_inv['inpaint_mask']=torch.cat([test_model_kwargs['inpaint_mask'],inpaint_mask_src],dim=0) 
+                            
+                            ####################
+                            
+                            if not os.path.exists(inverse_results_dir_for_batch):
+                                os.makedirs(inverse_results_dir_for_batch, exist_ok=True)
+                                x_noisy, intermediates = sampler.ddim_invert(x=z2,
+                                            cond=inverse_cond_inv,   # what happens if we use c
+                                            S=inverse_steps,
+                                            shape=shape,
+                                            eta=opt.ddim_eta,
+                                            unconditional_guidance_scale=opt.scale,
+                                            unconditional_conditioning=None,inverse_dir=inverse_results_dir_for_batch,
+                                            batch_size=test_batch.shape[0],
+                                            test_model_kwargs=test_model_kwargs_inv
+                                            )
+                                x_noisy = torch.load(os.path.join(inverse_results_dir_for_batch, 'ddim_latents_961.pt'))
+                            else:
+                                x_noisy = torch.load(os.path.join(inverse_results_dir_for_batch, 'ddim_latents_961.pt'))
+                                # start_code=x_noisy.to(x.device)
+                            
+                            # x_noisy_target,x_noisy_src=x_noisy.chunk(2,dim=0)
+                            
+                            start_code=x_noisy.to(x.device)
+                            # start_code=start_code1
+                            video1=test_batch.clone()
+                            # resize to 64,64
+                            # video1 = F.interpolate(video1, size=(opt.H // opt.f, opt.W // opt.f), mode='bilinear', align_corners=False)
+                            flow= return_flow(video1)
+                            
+                            # start_code=AdaIn_fusion(x_noisy_target,x_noisy_src,alpha=1.0,beta=0.8,normalized=True)
+                            # start_code=fft_fusion(x_noisy_target,x_noisy_src,center=3,center_exclude=1)
+                            # start_code= batch_flow_align_latent(
+                            #         x_prev=start_code,
+                            #         x_prev_recon=z2_tar,
+                            #         decode_fn=model.decode_first_stage,# or appropriate decoder
+                            #         encode_fn= model.encode_first_stage,
+                            #         first_stage_fn=model.get_first_stage_encoding,
+                            #         alpha=0.0  # control temporal smoothing
+                            #     )
+                            
+                        elif use_prior:
+                            prior=prior.to(device)
+                            encoder_posterior_2=model.encode_first_stage(prior)
+                            z2 = model.get_first_stage_encoding(encoder_posterior_2)
+                            noise = torch.randn_like(z2)
+                            x_noisy = model.q_sample(x_start=z2, t=t, noise=noise)
+                            start_code = x_noisy
+                            # print('start from target')
+                        else:
+                            noise = torch.randn_like(z)
+                            x_noisy = model.q_sample(x_start=z, t=t, noise=noise)
+                            if start_code is not None:
+                                start_code = x_noisy
+
+                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                        conditioning=c,
+                                                        target_conditioning=inverse_cond,
+                                                        inverse_results_dir=inverse_results_dir_for_batch,
+                                                        batch_size=test_batch.shape[0],
+                                                        shape=shape,
+                                                        verbose=False,
+                                                        unconditional_guidance_scale=opt.scale,
+                                                        unconditional_conditioning=uc,
+                                                        eta=opt.ddim_eta,
+                                                        x_T=start_code,
+                                                        flow=flow,
+                                                        test_model_kwargs=test_model_kwargs,
+                                                        src_im=ref_imgs.squeeze(1).to(torch.float32),
+                                                        tar=test_batch.to("cuda"))
+
+                    x_samples_ddim = model.decode_first_stage(samples_ddim)
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                    x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+
+                    x_checked_image=x_samples_ddim
+                    x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+
+                    if not opt.skip_save:
+                        for i,x_sample in enumerate(x_checked_image_torch):
+
+                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                            
+                            img = Image.fromarray(x_sample.astype(np.uint8)).resize((1024,1024), Image.BILINEAR)
+                            img.save(os.path.join(model_out_path, segment_id_batch[i]+".png"))
+                            
+                            orig_image=Image.open(os.path.join(target_frames_path, str(int(segment_id_batch[i]))+".png"))
+                            # To get the consistent output for background just encode and decode
+                            image_tensor = get_tensor()(orig_image)
+                            image_tensor_resize=transforms.Resize([opt.H, opt.W])(image_tensor)
+                            image_tensor_resize=image_tensor_resize.to(device)
+                            image_tensor_resize = image_tensor_resize.unsqueeze(0)
+                            encoder_posterior = model.encode_first_stage(image_tensor_resize)
+                            z = model.get_first_stage_encoding(encoder_posterior)
+                            image_tensor_resize=model.decode_first_stage(z)
+                            image_tensor_resize = torch.clamp((image_tensor_resize + 1.0) / 2.0, min=0.0, max=1.0)
+                            image_tensor_resize = image_tensor_resize.cpu().permute(0, 2, 3, 1).numpy()
+                            image_tensor_resize = Image.fromarray((255. * image_tensor_resize[0]).astype(np.uint8)).convert('RGB')
+                            image_conv = image_tensor_resize.resize((image_tensor.shape[1], image_tensor.shape[2]), Image.BILINEAR)
+                            
+                            inv_transforms=inv_transforms_all[int(segment_id_batch[i])]
+
+                            if opt.only_target_crop:                
+                                inv_trans_coeffs = inv_transforms
+                                swapped_and_pasted = img.convert('RGBA')
+                                pasted_image = image_conv.convert('RGBA')
+                                swapped_and_pasted.putalpha(255)
+                                projected = swapped_and_pasted.transform(orig_image.size, Image.PERSPECTIVE, inv_trans_coeffs, Image.BILINEAR)
+                                pasted_image.alpha_composite(projected)
+                            
+                            # save pasted image
+                            pasted_image.save(os.path.join(result_path, segment_id_batch[i]+".png"))
+                        
+                            base_count += 1
+
+                    if not opt.skip_grid:
+                        all_samples.append(x_checked_image_torch)
+
+    path = os.path.join(result_path, '*.png')
+    image_filenames = sorted(glob(path))
+
+    clips = ImageSequenceClip(image_filenames, fps=fps)
+    name = os.path.basename(out_video_filepath)
+
+
+    if not no_audio:
+        clips = clips.set_audio(video_audio_clip)
+
+    
+    clips.write_videofile(out_video_filepath,fps=fps, codec='libx264', audio_codec='aac', ffmpeg_params=['-pix_fmt:v', 'yuv420p', '-colorspace:v', 'bt709', '-color_primaries:v', 'bt709','-color_trc:v', 'bt709', '-color_range:v', 'tv', '-movflags', '+faststart'],logger=proglog.TqdmProgressBarLogger(print_messages=False))
+
+    # sace clips as gif
+    
+    clips.write_gif(os.path.join(outpath, name.replace('.mp4', '.gif')), fps=fps, logger=proglog.TqdmProgressBarLogger(print_messages=False))
+
+    path = os.path.join(target_frames_path, '*.png')
+    
+    image_filenames = sorted(glob(path))
+    clips = ImageSequenceClip(image_filenames, fps=fps)
+    clips.write_videofile(os.path.join(outpath, target_video_name+'_target.mp4'), fps=fps, codec='libx264', audio_codec='aac', ffmpeg_params=['-pix_fmt:v', 'yuv420p', '-colorspace:v', 'bt709',
+    '-color_primaries:v', 'bt709','-color_trc:v', 'bt709', '-color_range:v', 'tv', '-movflags', '+faststart'],logger=proglog.TqdmProgressBarLogger(print_messages=False))
+    clips.write_gif(os.path.join(outpath, target_video_name+'_target.gif'), fps=fps, logger=proglog.TqdmProgressBarLogger(print_messages=False))
+    print('\nDone! {}'.format(out_video_filepath))
+
+    print(f"Your samples are ready and waiting for you here: \n{out_video_filepath} \n"
+          f" \nEnjoy.")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -222,19 +679,26 @@ def main():
         default="a photograph of an astronaut riding a horse",
         help="the prompt to render"
     )
+
     parser.add_argument(
-        "--outdir",
+        "--data_config",
         type=str,
-        nargs="?",
-        help="dir to write results to",
-        default="results_video_new_REFace_analysis_flow2/New_Temporal_analysis_smith_flow/pnp_with_fft_flow_at_attn_out_10steps_0.5_check2"
+        help="path to data config",
     )
+
+    # parser.add_argument(
+    #     "--outdir",
+    #     type=str,
+    #     nargs="?",
+    #     help="dir to write results to",
+    #     default="results_video_new/debug"
+    # )
     parser.add_argument(
         "--Base_dir",
         type=str,
         nargs="?",
         help="dir to write cropped_images",
-        default="results_video_new_REFace_analysis_flow2"
+        default="results_video_new"
     )
     parser.add_argument(
         "--skip_grid",
@@ -326,13 +790,13 @@ def main():
         "--n_samples",
         type=int,
         default=6,
-        help="how many samples to produce. A.k.a. batch size",
+        help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
         "--n_frames",
         type=int,
-        default=18,
-        help="how many samples to produce for a video. A.k.a video length",
+        default=24,
+        help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
         "--n_rows",
@@ -346,20 +810,18 @@ def main():
         default=3.0,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
-    parser.add_argument(
-        "--target_video",
-        type=str,
-        help="target_video",
-        # default="dataset/FaceData/Data/VFHQ-Test/GT/Vid_Interval1_512x512_LANCZOS4/Clip+2W7Bk7EcRMg+P0+C1+F3663-3770/vid.mp4",
-        default="examples/FaceSwap/Videos/vid.mp4"
-    )
-    parser.add_argument(
-        "--src_image",
-        type=str,
-        help="src_image",
-        default="examples/FaceSwap/Source/will_smith.jpeg"
-        # default="examples/FaceSwap_10/Source/elon.jpeg"
-    )
+    # parser.add_argument(
+    #     "--target_video",
+    #     type=str,
+    #     help="target_video",
+    #     default="/egr/research-sprintai/baliahsa/mbz-back/Video_diffusion/AnyV2V/data/Data/VFHQ-Test/GT/Vid_Interval1_512x512_LANCZOS4/Clip+-1Jouc19Ixo+P0+C1+F4196-4320/vid.mp4",
+    # )
+    # parser.add_argument(
+    #     "--src_image",
+    #     type=str,
+    #     help="src_image",
+    #     default="/egr/research-sprintai/baliahsa/mbz-back/Video_diffusion/AnyV2V/data/Data/VFHQ-Test/Celeb_Source/10.jpg"
+    # )
     parser.add_argument(
         "--src_image_mask",
         type=str,
@@ -373,16 +835,13 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="models/REFace/configs/project_ffhq.yaml",
+        default="models/Paint-by-Example/v5_Two_CLIP_proj_154/checkpoints/project_ffhq.yaml",
         help="path to config which constructs model",
     )
     parser.add_argument(
         "--ckpt",
         type=str,
-        # default="models/Paint-by-Example/V5_without_FSA_154/checkpoints/epoch=000019.ckpt",
-        default="models/REFace/checkpoints/last.ckpt",
-        # default="models/Paint-by-Example/No_FSA_CIAI/checkpoints/epoch=000019.ckpt",
-        # default="models/Paint-by-Example/No_FSA_CIAI/checkpoints/epoch=000015.ckpt",
+        default="models/Paint-by-Example/V5_without_FSA_154/checkpoints/epoch=000019.ckpt",
         help="path to checkpoint of model",
     )
     parser.add_argument(
@@ -409,17 +868,15 @@ def main():
     parser.add_argument('--faceParsing_ckpt', type=str, default="Other_dependencies/face_parsing/79999_iter.pth")  
     parser.add_argument('--segnext_config', default='', type=str, help='Path to pre-trained SegNeXt faceParser configuration file, '
                                                                         'this option is valid when --faceParsing_ckpt=segenext')
-            
+
+    parser.add_argument('--video_base_dir', type=str, help='base dir for target videos')  
+    parser.add_argument('--image_dir', type=str, help='base dir for source images')
+    parser.add_argument('--output_base_dir', type=str, help='base dir for output videos')
+
     parser.add_argument('--save_vis', action='store_true')
     parser.add_argument('--seg12',default=True, action='store_true')
     
     opt = parser.parse_args()
-    print(opt)
-    if opt.laion400m:
-        print("Falling back to LAION 400M model...")
-        opt.config = "configs/latent-diffusion/txt2img-1p4B-eval.yaml"
-        opt.ckpt = "models/ldm/text2img-large/model.ckpt"
-        opt.outdir = "outputs/txt2img-samples-laion400m"
 
     seed_everything(opt.seed)
 
@@ -434,585 +891,39 @@ def main():
     else:
         sampler = DDIMSampler(model)
 
+    # Load YAML file
+    with open(opt.data_config, "r") as f:
+        pairs = yaml.safe_load(f)
 
-    os.makedirs(opt.outdir, exist_ok=True)
-    outpath = opt.outdir
-    Base_path=opt.Base_dir
+    ori_base_dir = opt.Base_dir
+    for video_dir, source_img in pairs.items():
+        try:
+            full_dir = os.path.join(opt.video_base_dir, video_dir)
+            video_files = glob(os.path.join(full_dir, "*.mp4"))
+            video_file = video_files[0] if video_files else None
+            if video_file is not None:
+                opt.target_video = video_file
+                opt.outdir = os.path.join(opt.output_base_dir, video_dir)
+                # if exists
+                if os.path.exists(opt.outdir):
+                    print(f"Output directory {opt.outdir} already exists. Skipping...")
+                    continue
+                opt.src_image = os.path.join(opt.image_dir, source_img)
+                opt.Base_dir = os.path.join(ori_base_dir, video_dir)
 
-    batch_size = opt.n_samples
-    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
-
-    else:
-        print(f"reading prompts from {opt.from_file}")
-        with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
-
-    # sample_path = os.path.join(outpath, "samples")
-    result_path = os.path.join(outpath, "results")
-    model_out_path = os.path.join(outpath, "model_outputs")
-    target_video_name=os.path.basename(opt.target_video).split('.')[0]
-    src_name=os.path.basename(opt.src_image).split('.')[0]
-    
-    target_frames_path=os.path.join(Base_path, target_video_name)
-    target_cropped_face_path=os.path.join(Base_path, target_video_name+"cropped_face")
-    mask_frames_path=os.path.join(Base_path, target_video_name+"mask_frames")
-    # os.makedirs(sample_path, exist_ok=True)
-    os.makedirs(result_path, exist_ok=True)
-    os.makedirs(target_frames_path, exist_ok=True)
-    os.makedirs(mask_frames_path, exist_ok=True)
-    os.makedirs(target_cropped_face_path, exist_ok=True)
-    os.makedirs(model_out_path, exist_ok=True)
-    out_video_filepath=os.path.join(outpath, target_video_name+'to'+src_name+'_swap.mp4')
-    
-    video_forcheck = VideoFileClip(opt.target_video)
-
-    if video_forcheck.audio is None:
-        no_audio = True
-    else:
-        no_audio = False
-
-    del video_forcheck
-
-    if not no_audio:
-        video_audio_clip = AudioFileClip(opt.target_video)
-    
-    video = cv2.VideoCapture(opt.target_video)
-    # video_shape
-    video_shape = (int(video.get(cv2.CAP_PROP_FRAME_WIDTH)), int(video.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-    temp_results_dir = os.path.join(outpath, 'temp_results')
-    inverse_results_dir=os.path.join(outpath, 'inverse_results')
-    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    # fps = video.get(cv2.CAP_PROP_FPS)
-    fps=10
-    os.makedirs(temp_results_dir, exist_ok=True)
-    os.makedirs(inverse_results_dir, exist_ok=True)
-    
-    faceParsing_model = init_faceParsing_pretrained_model(opt.faceParser_name, opt.faceParsing_ckpt, opt.segnext_config)
-    
-    
-    crops, orig_images, quads, inv_transforms = crop_and_align_face([opt.src_image])
-    crops = [crop.convert("RGB") for crop in crops]
-    T = crops[0]
-    src_image_new=os.path.join(temp_results_dir, src_name+'.png')
-    T.save(src_image_new)
-
-    
-    # src_image=cv2.imread(opt.src_image)
-    pil_im = Image.open(src_image_new).convert("RGB").resize((1024,1024), Image.BILINEAR)
-    mask = faceParsing_demo(faceParsing_model, pil_im, convert_to_seg12=opt.seg12, model_name=opt.faceParser_name)
-    Image.fromarray(mask).save(os.path.join(temp_results_dir, os.path.basename(opt.src_image)))
-    # base_count = len(os.listdir(sample_path))
-    # grid_count = len(os.listdir(outpath)) - 1
-    
-    # get count of mask_frames_path
-    base_count = len(os.listdir(target_frames_path))
-    mask_count= len(os.listdir(mask_frames_path))
-    
-    frame_count = opt.n_frames
-    
-    
-    if base_count != frame_count or mask_count != frame_count :
-        inv_transforms_all = []
+                run_inference(
+                    model,
+                    sampler,
+                    opt,
+                    device,
+                    config,
+                )
         
-        for frame_index in tqdm(range(frame_count)):
-            ret, frame = video.read() 
-            # if frame_index <1088:
-            #     continue
-            if ret:
-                try:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    Image.fromarray(frame).save(os.path.join(target_frames_path, f'{frame_index}.png'))
-                    crops, orig_images, quads, inv_transforms = crop_and_align_face([os.path.join(target_frames_path, f'{frame_index}.png')])
-                    frame_old = frame
-                    crops = [crop.convert("RGB") for crop in crops]
-                    T = crops[0]
-                    inv_transforms_all.append(inv_transforms[0])
-                    
-                    pil_im = T.resize((1024,1024), Image.BILINEAR)
-                    mask = faceParsing_demo(faceParsing_model, pil_im, convert_to_seg12=opt.seg12, model_name=opt.faceParser_name)
-                    Image.fromarray(mask).save(os.path.join(mask_frames_path, f'{frame_index}.png'))
-                    # save T
-                    T.save(os.path.join(target_cropped_face_path, f'{frame_index}.png'))
-                except:
-                    Image.fromarray(frame_old).save(os.path.join(target_frames_path, f'{frame_index}.png'))
-                    inv_transforms_all.append(inv_transforms[0])
-                    Image.fromarray(mask).save(os.path.join(mask_frames_path, f'{frame_index}.png'))
-                    # save T
-                    T.save(os.path.join(target_cropped_face_path, f'{frame_index}.png'))
-                    print('error finding face at', frame_index)
-                    pass
-        # save inv_transforms_all
-        np.save(os.path.join(Base_path,  target_video_name+'_inv_transforms.npy'), inv_transforms_all)
-        
-    # load inv_transforms_all
-    inv_transforms_all=np.load(os.path.join(Base_path,  target_video_name+'_inv_transforms.npy'), allow_pickle=True)
-    video.release()
-    del faceParsing_model
-    
-    
-    ################### Get reference
-    conf_file=OmegaConf.load(opt.config)
-    trans=A.Compose([
-            A.Resize(height=224,width=224)])
-    ref_img_path = src_image_new
-    
-    
-    
-    img_p_np=cv2.imread(ref_img_path)
-    # ref_img = Image.open(ref_img_path).convert('RGB').resize((224,224))
-    ref_img = cv2.cvtColor(img_p_np, cv2.COLOR_BGR2RGB)
-    # ref_img= cv2.resize(ref_img, (224, 224))
-    
-    ref_mask_path = os.path.join(temp_results_dir, os.path.basename(opt.src_image))
-    ref_mask_img = Image.open(ref_mask_path).convert('L')
-    ref_mask_img = np.array(ref_mask_img)  # Convert the label to a NumPy array if it's not already
-
-    # Create a mask to preserve values in the 'preserve' list
-    # preserve = [1,2,4,5,8,9,17 ]
-    preserve = conf_file.data.params.test.params['preserve_mask_src_FFHQ']
-    # preserve = [1,2,4,5,8,9 ]
-    ref_mask= np.isin(ref_mask_img, preserve)
-
-    # Create a converted_mask where preserved values are set to 255
-    ref_converted_mask = np.zeros_like(ref_mask_img)
-    ref_converted_mask[ref_mask] = 255
-    ref_converted_mask=Image.fromarray(ref_converted_mask).convert('L')
-    # convert to PIL image
-    
-    #Gray Mask
-    reference_mask_tensor=get_tensor(normalize=False, toTensor=True)(ref_converted_mask)
-    mask_ref=transforms.Resize((224,224))(reference_mask_tensor)
-    ref_img=trans(image=ref_img)
-    ref_img=Image.fromarray(ref_img["image"])
-    ref_img=get_tensor_clip()(ref_img)
-    ref_img=ref_img*mask_ref
-    ref_image_tensor = ref_img.to(device,non_blocking=True).to(torch.float16).unsqueeze(0)
-    
-    ######## Src Reconstruction ###########
-    ref_img_inv_ori=Image.open(ref_img_path).convert("RGB").resize((512,512), Image.BILINEAR)
-    ref_img_inv_ori = get_tensor()(ref_img_inv_ori)
-    ref_img_inv_ori= ref_img_inv_ori*reference_mask_tensor
-    
-    ref_img_inv_ori_inpaint=ref_img_inv_ori.clone()
-    ref_img_inv_ori_inpaint=ref_img_inv_ori_inpaint*(1-reference_mask_tensor)
-    #######################################
-    
-    
-    #Black_mask
-    # ref_mask_img=Image.fromarray(ref_img).convert('L')
-    # ref_mask_img_r = ref_converted_mask.resize(img_p_np.shape[1::-1], Image.NEAREST)
-    # ref_mask_img_r = np.array(ref_mask_img_r)
-    # ref_img[ref_mask_img_r==0]=0
-    # ref_img=trans(image=ref_img)
-    # ref_img=Image.fromarray(ref_img["image"])
-    # ref_img=get_tensor_clip()(ref_img)
-    # ref_image_tensor = ref_img.to(device,non_blocking=True).to(torch.float16).unsqueeze(0)
-    ########################
-    
-
-    test_args=conf_file.data.params.test.params
-    
-    
-    
-    
-    test_dataset=VideoDataset(data_path=target_cropped_face_path,mask_path=mask_frames_path,**test_args)
-    test_dataloader= torch.utils.data.DataLoader(test_dataset, 
-                                        batch_size=batch_size, 
-                                        num_workers=4, 
-                                        pin_memory=True, 
-                                        shuffle=False,#sampler=train_sampler, 
-                                        drop_last=True)
-
-
-
-
-
-    start_code = None
-    if opt.fixed_code:
-        print("Using fixed code.......")
-        start_code = torch.randn([ opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
-        # extend the start code to batch size
-        start_code = start_code.unsqueeze(0).repeat(batch_size, 1, 1, 1)
-
-   
-    
-    use_prior=False
-    use_ddim_inversion=True
-    
-    precision_scope = autocast if opt.precision=="autocast" else nullcontext
-    sample=0
-    
-    
-    # cond_only_once=False
-
-    
-    with torch.no_grad():
-        with precision_scope("cuda"):
-            with model.ema_scope():
-                all_samples = list()
-  
-  
-                for test_batch,prior, test_model_kwargs,segment_id_batch in test_dataloader:
-                    sample+=opt.n_samples
-                    # if sample<980:
-                    #     continue
-                    # breakpoint()
-                    
-                        
-                    test_model_kwargs={n:test_model_kwargs[n].to(device,non_blocking=True) for n in test_model_kwargs }
-                    uc = None
-                    if opt.scale != 1.0:
-                        uc = model.learnable_vector.repeat(test_batch.shape[0],1,1)
-                        if model.stack_feat:
-                            uc2=model.other_learnable_vector.repeat(test_batch.shape[0],1,1)
-                            uc=torch.cat([uc,uc2],dim=-1)
-                    
-                    # c = model.get_learned_conditioning(test_model_kwargs['ref_imgs'].squeeze(1).to(torch.float16))
-                    landmarks=model.get_landmarks(test_batch) if model.Landmark_cond else None
-                    ref_imgs=ref_image_tensor
-                    # stack it ref_imgs to the shape of test_batch
-                    ref_imgs=ref_imgs.repeat(test_batch.shape[0],1,1,1)
-                    
-                    ##############  Src Reconstruction ##########
-                    ref_img_inv=ref_img_inv_ori
-                    landmarks_src=model.get_landmarks(ref_img_inv.unsqueeze(0)) 
-                    cond_w_src=model.conditioning_with_feat(ref_imgs[0].unsqueeze(0).to(torch.float32),landmarks=landmarks_src,tar=ref_img_inv.unsqueeze(0).to("cuda").to(torch.float32)).float()
-                    cond_w_src=cond_w_src.repeat(test_batch.shape[0],1,1)
-                    ############################
-                    
-                    
-                    c=model.conditioning_with_feat(ref_imgs.squeeze(1).to(torch.float32),landmarks=landmarks,tar=test_batch.to("cuda").to(torch.float32)).float()
-                    if (model.land_mark_id_seperate_layers or model.sep_head_att) and opt.scale != 1.0:
-            
-                        # concat c, landmarks
-                        landmarks=landmarks.unsqueeze(1) if len(landmarks.shape)!=3 else landmarks
-                        uc=torch.cat([uc,landmarks],dim=-1)
-                    
-                    
-                    if c.shape[-1]==1024:
-                        c = model.proj_out(c)
-                    if len(c.shape)==2:
-                        c = c.unsqueeze(1)
-                    inpaint_image=test_model_kwargs['inpaint_image']
-                    inpaint_mask=test_model_kwargs['inpaint_mask']
-                    z_inpaint = model.encode_first_stage(test_model_kwargs['inpaint_image'])
-                    z_inpaint = model.get_first_stage_encoding(z_inpaint).detach()
-                    test_model_kwargs['inpaint_image']=z_inpaint
-                    test_model_kwargs['inpaint_mask']=Resize([z_inpaint.shape[-1],z_inpaint.shape[-1]])(test_model_kwargs['inpaint_mask'])
-
-                    ######## Src Reconstruction ###########
-                    inpaint_mask_src=1-reference_mask_tensor
-                    inpaint_image_src=ref_img_inv_ori_inpaint
-                    inpaint_image_src=inpaint_image_src.unsqueeze(0).to(device)
-                    z_inpaint_src = model.encode_first_stage(inpaint_image_src)
-                    z_inpaint_src = model.get_first_stage_encoding(z_inpaint_src).detach()
-                    inpaint_image_src=z_inpaint_src
-                    inpaint_mask_src=Resize([z_inpaint_src.shape[-1],z_inpaint_src.shape[-1]])(inpaint_mask_src)
-                    #######################################
-                    
-                    
-                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                    inverse_cond=None
-                    
-                    if opt.Start_from_target:
-                        print("Starting from target....")
-                        x=test_batch
-                        x=x.to(device)
-                        encoder_posterior = model.encode_first_stage(x)
-                        z = model.get_first_stage_encoding(encoder_posterior)
-                        
-                        
-                        # x = test_enc(
-                        #     x_prev=x,
-                        #     x_prev_recon=None,
-                        #     decode_fn=model.decode_first_stage,# or appropriate decoder
-                        #     encode_fn= model.encode_first_stage,
-                        #     first_stage_fn=model.get_first_stage_encoding,
-                        #     alpha=1.0  # control temporal smoothing
-                        # )
-                        
-                        
-                        t=int(opt.target_start_noise_t)
-                        # t = torch.ones((x.shape[0],), device=device).long()*t
-                        t = torch.randint(t-1, t, (x.shape[0],), device=device).long()
-                    
-                        if use_ddim_inversion:
-                            prior=prior.to(device)
-                            encoder_posterior_2=model.encode_first_stage(prior)
-                            z2 = model.get_first_stage_encoding(encoder_posterior_2)
-                            test_batch_clip=test_batch
-                            test_batch_clip=test_batch_clip.to(device)
-                            test_batch_clip=test_batch_clip*(1-inpaint_mask)
-                            test_batch_clip=un_norm(test_batch_clip)
-                            test_batch_clip=Resize([224,224])(test_batch_clip)
-                            test_batch_clip=TF.normalize(test_batch_clip, [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711])
-                            
-                            # visualize ref_imgs
-
-                            inverse_cond=model.conditioning_with_feat(test_batch_clip.to(torch.float32),landmarks=landmarks,tar=test_batch.to("cuda").to(torch.float32)).float()
-                            
-                            inverse_steps=50
-                            
-                            # prior=prior.to(device)
-                            # encoder_posterior_2=model.encode_first_stage(prior)
-                            # z2 = model.get_first_stage_encoding(encoder_posterior_2)
-                            
-                            ######## Src Reconstruction ###########
-                            ref_img_inv=ref_img_inv.repeat(test_batch.shape[0],1,1,1)
-                            ref_img_inv=ref_img_inv.to(device)
-                            encoder_posterior_ref=model.encode_first_stage(ref_img_inv)
-                            z_ref = model.get_first_stage_encoding(encoder_posterior_ref)
-                            z2_tar=z2
-                            z2=torch.cat([z2_tar,z_ref],dim=0)
-                            inverse_cond_inv=torch.cat([inverse_cond,cond_w_src],dim=0)
-                            test_model_kwargs_inv=test_model_kwargs.copy()
-                            
-                            
-                            # test_model_kwargs_inv['inpaint_image']=torch.cat([test_model_kwargs['inpaint_image'],test_model_kwargs['inpaint_image']],dim=0)  # just checking
-                            # test_model_kwargs_inv['inpaint_mask']=torch.cat([test_model_kwargs['inpaint_mask'],test_model_kwargs['inpaint_mask']],dim=0)  # just checking
-                            
-                            inpaint_image_src=inpaint_image_src.repeat(test_batch.shape[0],1,1,1)
-                            inpaint_mask_src=inpaint_mask_src.repeat(test_batch.shape[0],1,1,1).to(device)
-                            test_model_kwargs_inv['inpaint_image']=torch.cat([test_model_kwargs['inpaint_image'],inpaint_image_src ],dim=0)  # just checking
-                            test_model_kwargs_inv['inpaint_mask']=torch.cat([test_model_kwargs['inpaint_mask'],inpaint_mask_src],dim=0) 
-                            
-                            ####################
-                            
-                            
-                            x_noisy, intermediates = sampler.ddim_invert(x=z2,
-                                         cond=inverse_cond_inv,   # what happens if we use c
-                                         S=inverse_steps,
-                                         shape=shape,
-                                         eta=opt.ddim_eta,
-                                         unconditional_guidance_scale=opt.scale,
-                                         unconditional_conditioning=None,inverse_dir=inverse_results_dir,
-                                         batch_size=test_batch.shape[0],
-                                         test_model_kwargs=test_model_kwargs_inv,
-                                         src_lm=landmarks_src,
-                                         tar_lm=landmarks,
-                                         )
-                            
-                            x_noisy_target,x_noisy_src=x_noisy.chunk(2,dim=0)
-                            
-                            
-                            start_code = x_noisy_target
-                            video1=test_batch.clone()
-                            # resize to 64,64
-                            
-                            # video1 = F.interpolate(video1, size=(opt.H // opt.f, opt.W // opt.f), mode='bilinear', align_corners=False)
-                            
-                            # breakpoint()
-                            flow= return_flow(video1)
-                            
-
-                            
-                            # start_code=warp_from_video(start_code,video1, alpha=0.5)
-                            
-                            # start_code=x_noisy_target
-                            # start_code=start_code[0].repeat(opt.n_samples,1,1,1) # b,64,64,4
-                            
-                            # fft fusion
-                            
-                            
-                            # start_code=fft_fusion(x_noisy_target,x_noisy_src,center=3,center_exclude=1)
-                            
-                            # start_code= batch_flow_align_latent(
-                            #         x_prev=start_code,
-                            #         x_prev_recon=z2_tar,
-                            #         decode_fn=model.decode_first_stage,# or appropriate decoder
-                            #         encode_fn= model.encode_first_stage,
-                            #         first_stage_fn=model.get_first_stage_encoding,
-                            #         alpha=0.9  # control temporal smoothing
-                            #     )
-                            
-                            
-                            
-                            
-                            # warping the latents by target video
-                            
-                            
-                            
-                            # load  as start_code
-                            
-                            # start_code_all=torch.from_numpy(np.load("/egr/research-sprintai/baliahsa/mbz-back/Go-with-the-Flow/noise_warp_output_folder4/noises.npy")).to(device)
-                            # start_code=start_code_all[0:opt.n_samples] # b,64,64,4
-                            # start_code=start_code.to(device)
-                            # start_code=start_code.permute(0,3,1,2)
-                            
-                            # start_code=(x_noisy_target+ start_code)/1.41
-                            
-                            # start_code=x_noisy_target
-                            # start_code=x_noisy_src
-                            
-                            #lpf fusion
-                            # start_code=lpf_fusion(x_noisy_target,x_noisy_src)
-                            
-                            #adain fusion
-                            # start_code=AdaIn_fusion(x_noisy_target,x_noisy_src,alpha=1.0,beta=0.8,normalized=True)
-                            
-                            # start_code=(x_noisy_target+x_noisy_src)/1.41
-                            
-                           
-                        
-                        elif use_prior:
-                            prior=prior.to(device)
-                            encoder_posterior_2=model.encode_first_stage(prior)
-                            z2 = model.get_first_stage_encoding(encoder_posterior_2)
-                            noise = torch.randn_like(z2)
-                            x_noisy = model.q_sample(x_start=z2, t=t, noise=noise)
-                            start_code = x_noisy
-                            # print('start from target')
-                        else:
-                            noise = torch.randn_like(z)
-                            x_noisy = model.q_sample(x_start=z, t=t, noise=noise)
-                            start_code = x_noisy
-                        # print('start from target')
-                    
-                    
-                    
-                    # breakpoint()
-                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                        conditioning=c,
-                                                        target_conditioning=inverse_cond,
-                                                        inverse_results_dir=inverse_results_dir,
-                                                        batch_size=test_batch.shape[0],
-                                                        shape=shape,
-                                                        verbose=False,
-                                                        unconditional_guidance_scale=opt.scale,
-                                                        unconditional_conditioning=uc,
-                                                        eta=opt.ddim_eta,
-                                                        flow=flow,
-                                                        x_T=start_code,
-                                                        test_model_kwargs=test_model_kwargs,src_im=ref_imgs.squeeze(1).to(torch.float32),tar=test_batch.to("cuda"))
-                    # breakpoint()
-                    x_samples_ddim = model.decode_first_stage(samples_ddim)
-                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                    x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
-
-                    x_checked_image=x_samples_ddim
-                    x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
-
-                    
-
-                    if not opt.skip_save:
-                        for i,x_sample in enumerate(x_checked_image_torch):
-                            
-
-                            # all_img=[]
-                            # all_img.append(un_norm(test_batch[i]).cpu())
-                            # all_img.append(un_norm(inpaint_image[i]).cpu())
-                            # ref_img=test_model_kwargs['ref_imgs'].squeeze(1)
-                            # ref_img=Resize([512,512])(ref_img)
-                            # all_img.append(un_norm_clip(ref_img[i]).cpu())
-                            # all_img.append(x_sample)
-                            # grid = torch.stack(all_img, 0)
-                            # grid = make_grid(grid)
-                            # grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                            # img = Image.fromarray(grid.astype(np.uint8))
-                            # img.save(os.path.join(grid_path, 'grid-'+segment_id_batch[i]+'.png'))
-                            
-
-
-
-                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                            
-                            img = Image.fromarray(x_sample.astype(np.uint8)).resize((1024,1024), Image.BILINEAR)
-                            img.save(os.path.join(model_out_path, segment_id_batch[i]+".png"))
-                            
-                            orig_image=Image.open(os.path.join(target_frames_path, str(int(segment_id_batch[i]))+".png")).convert('RGB')
-                            
-                            # To get the consistent output for background just encode and decode
-                            image_tensor = get_tensor()(orig_image)
-                            image_tensor_resize=transforms.Resize([opt.H, opt.W])(image_tensor)
-                            image_tensor_resize=image_tensor_resize.to(device)
-                            image_tensor_resize = image_tensor_resize.unsqueeze(0)
-                            encoder_posterior = model.encode_first_stage(image_tensor_resize)
-                            z = model.get_first_stage_encoding(encoder_posterior)
-                            image_tensor_resize=model.decode_first_stage(z)
-                            image_tensor_resize = torch.clamp((image_tensor_resize + 1.0) / 2.0, min=0.0, max=1.0)
-                            image_tensor_resize = image_tensor_resize.cpu().permute(0, 2, 3, 1).numpy()
-                            image_tensor_resize = Image.fromarray((255. * image_tensor_resize[0]).astype(np.uint8)).convert('RGB')
-                            image_conv = image_tensor_resize.resize((image_tensor.shape[1], image_tensor.shape[2]), Image.BILINEAR)
-
-                            inv_transforms=inv_transforms_all[int(segment_id_batch[i])]
-                            #resize to video shape
-                            if opt.only_target_crop:                
-                                inv_trans_coeffs = inv_transforms
-                                swapped_and_pasted = img.convert('RGBA')
-                                pasted_image = image_conv.convert('RGBA')
-                                swapped_and_pasted.putalpha(255)
-                                projected = swapped_and_pasted.transform(orig_image.size, Image.PERSPECTIVE, inv_trans_coeffs, Image.BILINEAR)
-                                pasted_image.alpha_composite(projected)
-                            
-                            # save pasted image
-                            pasted_image.save(os.path.join(result_path, segment_id_batch[i]+".png"))
-                        
-                            
-                            
-                            
-                            base_count += 1
-
-
-
-                    if not opt.skip_grid:
-                        all_samples.append(x_checked_image_torch)
-
-    path = os.path.join(result_path, '*.png')
-    image_filenames = sorted(glob.glob(path))
-    # breakpoint()
-    clips = ImageSequenceClip(image_filenames, fps=fps)
-    name = os.path.basename(out_video_filepath)
-
-
-    if not no_audio:
-        clips = clips.set_audio(video_audio_clip)
-
-    # if out_video_filepath.lower().endswith('.gif'):
-    #     print("\nCreating GIF with FFmpeg...")
-    #     try:
-    #        subprocess.run('ffmpeg -y -v -8 -f image2 -framerate {} \
-    #            -i "./tmp_frames/frame_%07d.png" -filter_complex "[0:v]split [a][b];[a] \
-    #                palettegen=stats_mode=single [p];[b][p]paletteuse=dither=bayer:bayer_scale=4" \
-    #                    -y "{}.gif"'.format(fps, name), shell=True, check=True)
-    #        print("\nGIF created: {}".format(out_video_filename))
-
-    #     except subprocess.CalledProcessError:
-    #         print("\nERROR! Failed to export GIF with FFmpeg")
-    #         print('\n', sys.exc_info())
-    #         sys.exit(0)
-
-    # elif out_video_filename.lower().endswith('.webp'):
-    #     try:
-    #         print("\nCreating WEBP with FFmpeg...")
-    #         subprocess.run('ffmpeg -y -v -8 -f image2 -framerate {} \
-    #             -i "./tmp_frames/frame_%07d.png" -vcodec libwebp -lossless 0 -q:v 80 -loop 0 -an -vsync 0 \
-    #                 "{}.webp"'.format(fps, name), shell=True, check=True)
-    #         print("\nWEBP created: {}".format(out_video_filename))
-
-    #     except subprocess.CalledProcessError:
-    #         print("\nERROR! Failed to export WEBP with FFmpeg")
-    #         print('\n', sys.exc_info())
-    #         sys.exit(0)
-    # else:
-        # breakpoint()
-    clips.write_videofile(out_video_filepath,fps=fps, codec='libx264', audio_codec='aac', ffmpeg_params=['-pix_fmt:v', 'yuv420p', '-colorspace:v', 'bt709', '-color_primaries:v', 'bt709','-color_trc:v', 'bt709', '-color_range:v', 'tv', '-movflags', '+faststart'],logger=proglog.TqdmProgressBarLogger(print_messages=False))
-    clips.write_gif(os.path.join(outpath, name.replace('.mp4', '.gif')), fps=fps, logger=proglog.TqdmProgressBarLogger(print_messages=False))
-        # except Exception as e:
-        #     print("\nERROR! Failed to export video")
-        #     print('\n', e)
-        #     sys.exit(0)
-
-    print('\nDone! {}'.format(out_video_filepath))
-
-    print(f"Your samples are ready and waiting for you here: \n{out_video_filepath} \n"
-          f" \nEnjoy.")
+            else:
+                print(f"Video file not found in {full_dir}")
+        except Exception as e:
+            print(f"Error processing {video_dir}: {e}")
 
 
 if __name__ == "__main__":
     main()
-

@@ -7,104 +7,25 @@ from functools import partial
 from src.Face_models.encoders.model_irse import Backbone
 import torch.nn as nn
 import torchvision.transforms.functional as TF
-from torch.nn.functional import mse_loss, l1_loss
-import torch.nn.utils as utils
-import face_alignment
-import torch
-
-from eval_tool.Deep3DFaceRecon_pytorch.options.test_options import TestOptions
-from pretrained.face_parsing.model import BiSeNet, seg_mean, seg_std
-# from utils.module import SpecificNorm, cosin_metric
-
-
-class SpecificNorm(nn.Module):
-    def __init__(self, epsilon=1e-8):
-        """
-            @notice: avoid in-place ops.
-            https://discuss.pytorch.org/t/encounter-the-runtimeerror-one-of-the-variables-needed-for-gradient-computation-has-been-modified-by-an-inplace-operation/836/3
-        """
-        super(SpecificNorm, self).__init__()
-        # self.mean = np.array([0.485, 0.456, 0.406])
-        self.mean = np.array([0.5, 0.5, 0.5])
-        self.mean = torch.from_numpy(self.mean).float().cuda()
-        self.mean = self.mean.view([1, 3, 1, 1])
-
-        # self.std = np.array([0.229, 0.224, 0.225])
-        self.std = np.array([0.5, 0.5, 0.5])
-        self.std = torch.from_numpy(self.std).float().cuda()
-        self.std = self.std.view([1, 3, 1, 1])
-
-    def forward(self, x):
-        mean = self.mean.expand([1, 3, x.shape[2], x.shape[3]])
-        std = self.std.expand([1, 3, x.shape[2], x.shape[3]])
-
-        x = (x - mean) / std
-        return x
-
-# give empty string to use the default options
-dmm_defaults = TestOptions('')
-
-dmm_defaults=dmm_defaults.parse()
-
-from eval_tool.Deep3DFaceRecon_pytorch.models import create_model
-
-def get_eye_coords(fa, image):
-    image = image.squeeze(0)
-    image = image * 128 + 128
-    image = image.to(torch.uint8)
-    image = image.permute(1, 2, 0)
-    image = image.cpu().numpy()
-
-    try:
-        preds = fa.get_landmarks(image)[0]
-    except:
-        return [None] * 8
-
-    x, y = 5, 9
-    left_eye_left = preds[36]
-    left_eye_right = preds[39]
-    eye_y_average = (left_eye_left[1] + left_eye_right[1]) // 2
-    left_eye = [int(left_eye_left[0]) - x, int(eye_y_average - y), int(left_eye_right[0]) + x, int(eye_y_average + y)]
-    right_eye_left = preds[42]
-    right_eye_right = preds[45]
-    eye_y_average = (right_eye_left[1] + right_eye_right[1]) // 2
-    right_eye = [int(right_eye_left[0]) - x, int(eye_y_average - y), int(right_eye_right[0]) + x, int(eye_y_average + y)]
-    return [*left_eye, *right_eye]
-
-def get_eye_coords_from_landmarks(fa, landmarks):
-    preds=landmarks if  landmarks[0][0] !=0 else None
-    if preds is None:
-        return [None] * 8
-     
-    x, y = 5, 9
-    left_eye_left = preds[36]
-    left_eye_right = preds[39]
-    eye_y_average = (left_eye_left[1] + left_eye_right[1]) // 2
-    left_eye = [int(left_eye_left[0]) - x, int(eye_y_average - y), int(left_eye_right[0]) + x, int(eye_y_average + y)]
-    right_eye_left = preds[42]
-    right_eye_right = preds[45]
-    eye_y_average = (right_eye_left[1] + right_eye_right[1]) // 2
-    right_eye = [int(right_eye_left[0]) - x, int(eye_y_average - y), int(right_eye_right[0]) + x, int(eye_y_average + y)]
-    return [*left_eye, *right_eye]
-
-def get_full_coords(fa,image):
-    image = image
-    # image = image * 128 + 128
-    # image = image.to(torch.uint8)
-    # image = image.permute(1, 2, 0)
-    # image = image.cpu().numpy()
-
-    try:
-        preds = fa.face_alignment_net(image)
-        # breakpoint()
-    except:
-        return [None] * 62
-    return preds
-
-from Other_dependencies.gaze_estimation.gaze_estimator import Gaze_estimator
-
+import os
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, \
     extract_into_tensor
+    
+from PIL import Image
+from ldm.models.pnp_utils import *
+from scripts.face_swap_utils import *
+from scripts.temporal_flow import batch_flow_align,batch_flow_align_latent,align_by_flow,align_by_flow_high_res
+
+
+
+
+def load_ddim_latents_at_t(t, ddim_latents_path):
+    ddim_latents_at_t_path = os.path.join(ddim_latents_path, f"ddim_latents_{t}.pt")
+    assert os.path.exists(ddim_latents_at_t_path), f"Missing latents at t {t} path {ddim_latents_at_t_path}"
+    ddim_latents_at_t = torch.load(ddim_latents_at_t_path)
+    return ddim_latents_at_t
+
+
 
 def un_norm_clip(x1):
     x = x1*1.0 # to avoid changing the original tensor or clone() can be used
@@ -119,6 +40,35 @@ def un_norm_clip(x1):
     if reduce:
         x = x.squeeze(0)
     return x
+
+def un_norm(x):
+    return (x+1.0)/2.0
+
+def save_clip_img(img, path,clip=True):
+    if clip:
+        img=un_norm_clip(img)
+    else:
+        img=torch.clamp(un_norm(img), min=0.0, max=1.0)
+    img = img.cpu().numpy().transpose((1, 2, 0))
+    img = (img * 255).astype(np.uint8)
+    img = Image.fromarray(img)
+    img.save(path)
+    
+def save_latent_img(model,latents, path,ind=0):
+    img=model.decode_first_stage(latents)
+    img = torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
+    img = img.cpu().permute(0, 2, 3, 1).numpy()
+    img=img[ind]
+    img = (img * 255).astype(np.uint8)
+    img = Image.fromarray(img)
+    img.save(path)
+    
+def analyse_fft(tar,src,model):
+    for i in range(1,64):
+        for j in range(i):
+            
+            save_noise=fft_fusion(tar,src,center=i,center_exclude=j)
+            save_latent_img(model,save_noise,path=f"Debug/fft_analysis/comb_{i}_{j}.jpg",ind=4)
 
 class IDLoss(nn.Module):
     def __init__(self,path="Other_dependencies/arcface/model_ir_se50.pth",multiscale=False):
@@ -194,26 +144,6 @@ class DDIMSampler(object):
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
-        self.netGaze = Gaze_estimator().to(self.model.device)
-        self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
-        
-        self.models_3dmm = create_model(dmm_defaults)
-        self.models_3dmm.setup(dmm_defaults)
-        
-        if torch.cuda.is_available():
-            self.models_3dmm.net_recon.cuda()
-        
-        self.seg = BiSeNet(n_classes=19)
-        if torch.cuda.is_available():
-            self.seg.to(self.model.device)
-
-        self.seg.load_state_dict(torch.load("Other_dependencies/face_parsing/79999_iter.pth"))
-        for param in self.seg.parameters():
-            param.requires_grad = False
-        self.seg.eval()
-        
-        self.spNorm = SpecificNorm()
-        
         # self.ID_LOSS=IDLoss()
 
     def register_buffer(self, name, attr):
@@ -259,6 +189,8 @@ class DDIMSampler(object):
                batch_size,
                shape,
                conditioning=None,
+               target_conditioning=None,
+               inverse_results_dir=None,
                callback=None,
                normals_sequence=None,
                img_callback=None,
@@ -271,6 +203,7 @@ class DDIMSampler(object):
                score_corrector=None,
                corrector_kwargs=None,
                verbose=True,
+               flow=None,
                x_T=None,
                log_every_t=100,
                unconditional_guidance_scale=1.,
@@ -292,8 +225,13 @@ class DDIMSampler(object):
         C, H, W = shape
         size = (batch_size, C, H, W)
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
-
-        samples, intermediates = self.ddim_sampling(conditioning, size,
+        
+        
+        
+        samples, intermediates = self.ddim_sampling(conditioning,     
+                                                    size,
+                                                    target_conditioning=target_conditioning,
+                                                    inverse_results_dir=inverse_results_dir,
                                                     callback=callback,
                                                     img_callback=img_callback,
                                                     quantize_denoised=quantize_x0,
@@ -304,22 +242,26 @@ class DDIMSampler(object):
                                                     score_corrector=score_corrector,
                                                     corrector_kwargs=corrector_kwargs,
                                                     x_T=x_T,
+                                                    flow=flow,
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
-                                                    src_im=src_im,tar=tar,
+                                                    src_im=src_im,
                                                     **kwargs
                                                     )
         return samples, intermediates
 
     @torch.no_grad()
     def ddim_sampling(self, cond, shape,
+                      target_conditioning=None,
+                      inverse_results_dir=None,
                       x_T=None, ddim_use_original_steps=False,
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,src_im=None,tar=None,**kwargs):
+                      temperature=1., noise_dropout=0., score_corrector=None,flow=None, corrector_kwargs=None,
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,src_im=None,**kwargs):
         device = self.model.betas.device
+        
         b = shape[0]
         if x_T is None:
             img = torch.randn(shape, device=device)
@@ -340,7 +282,34 @@ class DDIMSampler(object):
         iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
         if src_im is not None:
             src_im=un_norm_clip(src_im)
+
+        # TODO: properly code injection schedule
+        # pnp injection
+        # switch off pnp injection
+        register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1", chunks=3)
+        #pnp feature transfer    
+        register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1", chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="fft",split_ratio_fft=0.8,alpha=0.0)
+        # register_conv_injection(self, 1) 
+        # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1", chunks=3,block_indices=[6,7],fusion="temporal")
+        # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=False, output_blocks=False,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3],fusion="flow_fix")
+        
+        # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="fft")
+        
+        # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1", chunks=3,block_indices=[0,1,2],fusion="fft")
+        
         for i, step in enumerate(iterator):
+            
+            if True:
+                register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.0)
+                # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[8],fusion="flow_fix")
+                register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=False, output_blocks=False,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.0)
+            else:
+                register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=False, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="flow_fix",split_ratio_fft=0.8,alpha=0.0)    
+                register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1",flow=flow, chunks=3,block_indices=[0,1,2,3,4,5,6,7,8],fusion="fft",split_ratio_fft=0.8,alpha=0.0)
+            # if i==total_steps//2:
+                # register_spa_attn_injection(self, 1,switch_on=False,input_blocks=False,output_blocks=True,attn_component="attn1")
+                # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,output_blocks=False,attn_component="attn1")
+            
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
 
@@ -348,12 +317,33 @@ class DDIMSampler(object):
                 assert x0 is not None
                 img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
                 img = img_orig * mask + (1. - mask) * img
-            outs = self.p_sample_ddim_guided_forward(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
-                                      quantize_denoised=quantize_denoised, temperature=temperature,
-                                      noise_dropout=noise_dropout, score_corrector=score_corrector,
-                                      corrector_kwargs=corrector_kwargs,
-                                      unconditional_guidance_scale=unconditional_guidance_scale,
-                                      unconditional_conditioning=unconditional_conditioning,src_im=src_im,tar=tar,**kwargs)
+            if target_conditioning is not None:
+                
+                # pnp conv transfer
+                src_start=None
+                # if i==0:
+                #     # create random noise like img
+                #     src_start=torch.randn_like(img)
+                
+                outs = self.p_sample_ddim_with_inverse(img, cond, ts, 
+                                        target_conditioning=target_conditioning,
+                                        inverse_results_dir=inverse_results_dir,
+                                        index=index,src_start=None, use_original_steps=ddim_use_original_steps,
+                                        quantize_denoised=quantize_denoised, temperature=temperature,
+                                        noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                        corrector_kwargs=corrector_kwargs,
+                                        unconditional_guidance_scale=unconditional_guidance_scale,flow=flow,
+                                        unconditional_conditioning=unconditional_conditioning,src_im=src_im,**kwargs)
+            else:
+                outs = self.p_sample_ddim(img, cond, ts,
+                                        index=index, use_original_steps=ddim_use_original_steps,
+                                        quantize_denoised=quantize_denoised, temperature=temperature,
+                                        noise_dropout=noise_dropout, score_corrector=score_corrector,
+                                        corrector_kwargs=corrector_kwargs,
+                                        unconditional_guidance_scale=unconditional_guidance_scale,
+                                        unconditional_conditioning=unconditional_conditioning,src_im=src_im,**kwargs)
+            
+            
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -363,452 +353,148 @@ class DDIMSampler(object):
                 intermediates['pred_x0'].append(pred_x0)
 
         return img, intermediates
-
-    @torch.no_grad()
-    def p_sample_ddim_guided_forward(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,src_im=None,tar=None,**kwargs):
-        b, *_, device = *x.shape, x.device
-        if 'test_model_kwargs' in kwargs:
-            kwargs=kwargs['test_model_kwargs']
-            x = torch.cat([x, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
-        elif 'rest' in kwargs:
-            x = torch.cat((x, kwargs['rest']), dim=1)
-        else:
-            raise Exception("kwargs must contain either 'test_model_kwargs' or 'rest' key")
-        
-        torch.set_grad_enabled(True)
-        x_in = x.detach().requires_grad_(True)
-        
-        
-        
-        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.apply_model(x_in, t, c)
-        else:  # check @ sanoojan
-            x_in_n = torch.cat([x_in] * 2) #x_in: 2,9,64,64
-            t_in = torch.cat([t] * 2)
-            c_in = torch.cat([unconditional_conditioning, c]) #c_in: 2,1,768
-            e_t_uncond, e_t = self.model.apply_model(x_in_n, t_in, c_in).chunk(2)
-            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond) #1,4,64,64
-
-        if score_corrector is not None:
-            assert self.model.parameterization == "eps"
-            e_t = score_corrector.modify_score(self.model, e_t, x_in, t, c, **corrector_kwargs)
-
-        
-
-
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-        # select parameters corresponding to the currently considered timestep
-        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-
-        # current prediction for x_0
-        if x.shape[1]!=4:
-            pred_x0 = (x_in[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            # G_id=ID_LOSS
-            seperate_sim=None
-            # src_im=None
-            if src_im is not None:
-                pred_x0_im=self.model.differentiable_decode_first_stage(pred_x0)
-                masks=1-TF.resize(x_in[:,8,:,:],(pred_x0_im.shape[2],pred_x0_im.shape[3]))
-                #mask x_samples_ddim
-                pred_x0_im_masked=pred_x0_im*masks.unsqueeze(1)
-                # x_samples_ddim_masked=un_norm_clip(x_samples_ddim_masked)
-                # x_samples_ddim_masked = TF.normalize(x_samples_ddim_masked, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-                Loss=0
-                # breakpoint()
-                # im_rec=torch.clamp((pred_x0_im_masked + 1.0) / 2.0, min=0.0, max=1.0)
-                # im_tar=torch.clamp((tar + 1.0) / 2.0, min=0.0, max=1.0)
-                # im_src=torch.clamp(src_im, min=0.0, max=1.0)
-                
-                
-                # Segmentation Loss
-                ################################
-                # src_mask  = (pred_x0_im + 1) / 2
-                # src_mask  = TF.resize(src_mask,(512,512))
-                # src_mask  = TF.normalize(src_mask, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                # targ_mask = (tar + 1) / 2
-                # targ_mask  = TF.resize(targ_mask,(512,512))
-                # targ_mask = TF.normalize(targ_mask, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                # # breakpoint()
-                # src_seg  = self.seg(self.spNorm(src_mask))[0]
-                # # breakpoint()
-                # src_seg = TF.resize(src_seg, (256, 256))
-                # targ_seg = self.seg(self.spNorm(targ_mask))[0]
-                # targ_seg = TF.resize(targ_seg, (256, 256))
-
-                # seg_loss = torch.tensor(0).to(self.model.device).float()
-
-                # # Attributes = [0, 'background', 1 'skin', 2 'r_brow', 3 'l_brow', 4 'r_eye', 5 'l_eye', 6 'eye_g', 7 'l_ear', 8 'r_ear', 9 'ear_r', 10 'nose', 11 'mouth', 12 'u_lip', 13 'l_lip', 14 'neck', 15 'neck_l', 16 'cloth', 17 'hair', 18 'hat']
-                # ids = [1,11, 12, 13]
-
-                # for id in ids:
-                #     seg_loss += l1_loss(src_seg[:,id,:,:], targ_seg[:,id,:,:])
-                #     # seg_loss += mse_loss(src_seg[0,id,:,:], targ_seg[0,id,:,:])
-
-                # Loss = Loss + seg_loss * 10
-                ################################
-                
-                #3DMM Loss
-                ################################
-                # im_rec=(pred_x0_im_masked + 1.0) / 2.0
-                
-                # #resize im_tar to 512x512
-                
-                # im_tar=(tar + 1.0) / 2.0
-                # im_src=TF.resize(src_im,(512,512))
-                
-                # im_conc=torch.cat((im_rec,im_tar,im_src),dim=0)
-                # c_all=self.models_3dmm.net_recon(im_conc)
-                # c_rec=c_all[:b]
-                # c_tar=c_all[b:2*b]
-                # c_src=c_all[2*b:]
-                
-                
-                # # breakpoint()
-                # # c_rec=self.models_3dmm.net_recon(im_rec)
-                # # c_tar=self.models_3dmm.net_recon(im_tar)
-                # # c_src=self.models_3dmm.net_recon(im_src)
-                
-                # target_filt_c_rec=c_rec[:, 80:144]
-                # target_filt_c_tar=c_tar[:, 80:144]
-                
-                # #select 0:80 and 144:224
-                # src_filt_c_rec=torch.cat((c_rec[:, :80],c_rec[:, 144:224]),dim=1)
-                # src_filt_c_src=torch.cat((c_src[:, :80],c_src[:, 144:224]),dim=1)
-                
-                
-                # # src_filt_c_rec=c_rec[:, 144:224]
-                # # src_filt_c_src=c_src[:, 144:224]
-                
-                
-                # # id_coeffs = coeffs[:, :80]
-                # # exp_coeffs = coeffs[:, 80: 144]
-                # # tex_coeffs = coeffs[:, 144: 224]
-                # # angles = coeffs[:, 224: 227]
-                # # gammas = coeffs[:, 227: 254]
-                # # translations = coeffs[:, 254:]
-                        
-                # # cosine loss between the two reconstructions
-                # # cosine_loss =1- torch.nn.functional.cosine_similarity(target_filt_c_rec, target_filt_c_tar, dim=1)
-                
-                # # cosine_loss =1- torch.nn.functional.cosine_similarity(src_filt_c_rec, src_filt_c_src, dim=1)
-                # cosine_loss_tar=1- torch.nn.functional.cosine_similarity(target_filt_c_rec, target_filt_c_tar, dim=1)
-                # # L2_loss = mse_loss(src_filt_c_rec, src_filt_c_src)
-                
-                # Loss+=cosine_loss_tar.sum()*100.0
-                # # +cosine_loss_tar.sum()*100.0
-                ################################
-                
-                # GAZE Loss
-                ################################
-                # if t[0]>10 and t[0]<200:
-                    
-                #     src_eyes = pred_x0_im_masked * 0.5 + 0.5
-                #     targ_eyes = tar
-                #     targ_eyes = targ_eyes * 0.5 + 0.5
-                #     for targ_eye,src_eye in zip(targ_eyes, src_eyes):
-                #         targ_eye = targ_eye.unsqueeze(0)
-                #         src_eye = src_eye.unsqueeze(0)
-                #         try:
-                #             llx, lly, lrx, lry, rlx, rly, rrx, rry = get_eye_coords(self.fa, targ_eye)
     
-                #             if llx is not None:
-                #                 targ_left_eye   = targ_eye[:, :, lly:lry, llx:lrx]
-                #                 src_left_eye    = src_eye[:, :, lly:lry, llx:lrx]
-                #                 targ_right_eye  = targ_eye[:, :, rly:rry, rlx:rrx]
-                #                 src_right_eye   = src_eye[:, :, rly:rry, rlx:rrx]
-                #                 targ_left_eye   = torch.mean(targ_left_eye, dim=1, keepdim=True)
-                #                 src_left_eye    = torch.mean(src_left_eye, dim=1, keepdim=True)
-                #                 targ_right_eye  = torch.mean(targ_right_eye, dim=1, keepdim=True)
-                #                 src_right_eye   = torch.mean(src_right_eye, dim=1, keepdim=True)
-                #                 targ_left_gaze  = self.netGaze(targ_left_eye.squeeze(0))
-                #                 src_left_gaze   = self.netGaze(src_left_eye.squeeze(0))
-                #                 targ_right_gaze = self.netGaze(targ_right_eye.squeeze(0))
-                #                 src_right_gaze  = self.netGaze(src_right_eye.squeeze(0))
-                #                 left_gaze_loss  = l1_loss(targ_left_gaze, src_left_gaze)
-                #                 right_gaze_loss = l1_loss(targ_right_gaze, src_right_gaze)
-                #                 gaze_loss = (left_gaze_loss + right_gaze_loss) * 1
+    
 
-                #                 Loss+=gaze_loss.sum()
-                #         except:
-                #             print("Error in Gaze Estimation")
-                
-                #ID LOSS        
-                #####################
-                # if t[0]>5 and t[0]<500:
-                #     ID_loss,_,seperate_sim=self.model.face_ID_model(pred_x0_im_masked,src_im,clip_img=False,return_seperate=True)
-                #     Loss+=ID_loss
-                        # breakpoint()
-                ######################################
-                        
-                # #Landmark_loss  Some problem with detected landmarks
-                # if t[0]>5 and t[0]<300:
-                #     src_eyes = pred_x0_im * 0.5 + 0.5
-                #     targ_eyes = tar
-                #     targ_eyes = targ_eyes * 0.5 + 0.5
-                #     for targ_eye,src_eye in zip(targ_eyes, src_eyes):
-                #         targ_eye = targ_eye.unsqueeze(0)
-                #         src_eye = src_eye.unsqueeze(0)
-                        
-                #         try:
-                #             preds = get_full_coords(self.fa, targ_eye)
-                #             pred_swap = get_full_coords(self.fa, src_eye)
+    
+    @torch.no_grad()
+    def ddim_invert(self, x, cond, S, shape, eta=0., 
+                    unconditional_guidance_scale=1., 
+                    unconditional_conditioning=None,inverse_dir=None,batch_size=6,src_lm=None,tar_lm=None, **kwargs):
+        """
+        Perform DDIM inversion to estimate the noise that led to the given image `x`.
 
-                #             # Extract batch size
-                #             B = preds.shape[0]
+        Args:
+            x: The observed image to be inverted.
+            cond: Conditioning input (e.g., text embeddings).
+            S: Number of steps used in sampling.
+            shape: Shape of the input tensor.
+            eta: DDIM noise parameter.
+            unconditional_guidance_scale: Scale for classifier-free guidance.
+            unconditional_conditioning: Unconditional conditioning for guidance.
 
-                #             # Reshape to (B, 68, 128*128)
-                #             preds_flat = preds.view(B, 68, -1)
-                #             pred_swap_flat = pred_swap.view(B, 68, -1)
-
-                #             # Find argmax indices
-                #             preds_flat = torch.softmax(preds_flat, dim=-1)
-                #             pred_swap_flat = torch.softmax(pred_swap_flat, dim=-1)
-
-                #             breakpoint()
-                #             # Calculate x and y indices
-                #             # h, w = preds.shape[2], preds.shape[3]
-                #             # indices_x = argmax_indices // w
-                #             # indices_y = argmax_indices % w
-                #             # indices_x_swap = argmax_indices_swap // w
-                #             # indices_y_swap = argmax_indices_swap % w
-
-                #             # Stack x and y indices
-                #             # pred_coord = torch.stack((indices_x, indices_y), dim=-1).float()
-                #             # pred_swap_coord = torch.stack((indices_x_swap, indices_y_swap), dim=-1).float()
-                #             # breakpoint()
-                #             # Select landmarks 48:67 and calculate MSE loss
-                #             landmark_loss = mse_loss(preds_flat[:, 48:68, :], pred_swap_flat[:, 48:68, :])
-
-                #             # Add the loss to the total loss
-                #             Loss += landmark_loss 
-                            
-                #         except:
-                #             print("Error in Landmark Estimation")
-                ################################  
-                
-                
-                
-                
-                
-                # breakpoint()
-                if Loss!=0:
-                    grad=torch.autograd.grad(-1*Loss, x_in)[0]
-                    grad=grad*5.0
-                    grad=grad[:,:4,:,:].detach()
-                    e_t=e_t-sqrt_one_minus_at*grad
-                    x_in=x_in.requires_grad_(False)
-                    del pred_x0,pred_x0_im_masked,grad,x_in,masks,pred_x0_im
-                    torch.set_grad_enabled(False)
-                else:
-                    del pred_x0,pred_x0_im_masked,pred_x0_im
-                    torch.set_grad_enabled(False)
-        else:
-            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            
-        if quantize_denoised:
-            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
-        # direction pointing to x_t
-        with torch.no_grad():
-            pred_x0 = (x[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-            noise = sigma_t * noise_like(dir_xt.shape, device, repeat_noise) * temperature
-            if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-            x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-            
-            del dir_xt,noise,x
-            #     x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-            # else:  
-            #     seperate_sim=3*torch.tensor(seperate_sim)
-            #     #make upper limit 1 and lower limit 0
-            #     seperate_sim=torch.clamp(seperate_sim,0,1)
-            #     x_prev = a_prev.sqrt() * pred_x0 + seperate_sim.view(-1,1,1,1).to(self.model.device)*dir_xt + noise
-            return x_prev, pred_x0
+        Returns:
+            x_T: The estimated initial noise (x_T).
+            intermediates: Intermediate steps from inversion.
+        """
+        device = x.device
+        b = x.shape[0]
         
+        
+        self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
+        timesteps = self.ddim_timesteps
+
+        intermediates = {'x_inter': [x]}
+        
+        register_spa_attn_injection(self, 1,switch_on=False,input_blocks=True,middle_block=True, output_blocks=True,attn_component="attn1", chunks=3)
+        # register_spa_attn_injection(self, 1,switch_on=True,input_blocks=True,middle_block=False, output_blocks=True,attn_component="attn1", chunks=2,block_indices=[0,1,2])
+        
+        for i, step in enumerate(tqdm(timesteps, desc="DDIM Inversion", total=len(timesteps))):
+            
+            #skip last step
+            # if i > len(timesteps) :
+            #     continue
+            
+            # if i>len(timesteps)//2:
+            #     register_spa_attn_injection(self, 1,switch_on=False,input_blocks=False,middle_block=False, output_blocks=True,attn_component="attn1", chunks=2)
+                
+            
+            inversion_save_path="Debug/inversions4"
+            debug=False
+            if debug:
+                if not os.path.exists(inversion_save_path):
+                    os.makedirs(inversion_save_path)
+                # save x
+                img=self.model.decode_first_stage(x)
+                save_clip_img(img[0], os.path.join(inversion_save_path, f"ddim_inversion_{step}.png"),clip=False)
+                
+                
+                # img=un_norm_clip(img)
+                # img = TF.normalize(img, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                # img = TF.to_pil_image(img[0].cpu())
+                # img.save(os.path.join(inversion_save_path, f"ddim_inversion_{step}.png"))
+            
+            
+            index = i
+            ts = torch.full((b,), step, device=device, dtype=torch.long)
+            if 'test_model_kwargs' in kwargs:
+                kwargs1=kwargs['test_model_kwargs']
+                x = torch.cat([x, kwargs1['inpaint_image'], kwargs1['inpaint_mask']],dim=1)
+            elif 'rest' in kwargs:
+                x = torch.cat((x, kwargs['rest']), dim=1)
+            # Predict noise and reconstruct x_T step by step
+            if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+                e_t = self.model.apply_model(x, ts, cond)
+            else:
+                x_in = torch.cat([x] * 2)
+                t_in = torch.cat([ts] * 2)
+                c_in = torch.cat([unconditional_conditioning, cond])
+                e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+                e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
+
+            alphas = self.ddim_alphas
+            sqrt_one_minus_alphas = self.ddim_sqrt_one_minus_alphas
+            sigmas = self.ddim_sigmas
+
+            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
+            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index], device=device)
+
+            alpha_next_t=self.alphas_cumprod[step]
+            # alpha_next_t=torch.full((b, 1, 1, 1), alpha_next_t, device=device)
+            
+            current_t=max(0,step-(1000//len(timesteps)))
+            alpha_t = self.alphas_cumprod[current_t]
+            
+            # nosie=(x[:,:4,:,:]-sqrt_one_minus_at*e_t)*alpha_next_t.sqrt()/a_t.sqrt()+(1-alpha_next_t).sqrt()*e_t
+            nosie=(x[:,:4,:,:]-(1-alpha_t).sqrt()*e_t)*alpha_next_t.sqrt()/alpha_t.sqrt()+(1-alpha_next_t).sqrt()*e_t
+            
+            # # Reverse step
+            # pred_x0 = (x[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
+            # nosie = (x[:,:4,:,:] - a_t.sqrt() * pred_x0) / (1. - a_t).sqrt()
+            
+            # pred_x0 = (x[:,:4,:,:] - (1-alpha_t).sqrt() * e_t) / a_t.sqrt()
+            # nosie = (x[:,:4,:,:] - alpha_t.sqrt() * pred_x0) / (1. - alpha_t).sqrt()
+
+            # Store intermediate results
+            intermediates['x_inter'].append(nosie)
+            
+            x = nosie  # Update x to continue inversion
+            
+            # save_noise= ((nosie[:batch_size]+nosie[batch_size:])/1.41)
+            x_noisy_target= nosie[:batch_size]
+            x_noisy_src= nosie[batch_size:]
+            if i<len(timesteps)//2:
+                # save_noise=fft_fusion(x_noisy_target,x_noisy_src,center=17,center_exclude=0)
+                # save_noise= AdaIn_fusion(nosie[:batch_size],nosie[batch_size:],alpha=1.0,beta=0.8,normalized=True)
+                save_noise=x_noisy_target
+                # save_noise=x_noisy_src
+            else:
+                
+                # save_noise= AdaIn_fusion(nosie[:batch_size],nosie[batch_size:],alpha=1.0,beta=0.8,normalized=True)
+                # save_noise=fft_fusion(x_noisy_target,x_noisy_src,center=17,center_exclude=0)
+                save_noise=x_noisy_target
+                # save_noise=x_noisy_src
+            # if i == 1:
+            #     save_noise_2=fft_fusion_warp(x_noisy_target,x_noisy_src,center=5,center_exclude=3,lm_src=src_lm,lm_tar=tar_lm)
+            #     save_latent_img(self.model ,save_noise_2,path=f"Debug/yohan/comb_check.jpg",ind=5)
+                
+            
+            # save noise
+            torch.save(
+                save_noise.detach().clone(),
+                os.path.join(inverse_dir, f"ddim_latents_{step}.pt"),
+            )
+            
+            
+
+        return nosie, intermediates
+    
+    
+
     @torch.no_grad()
     def p_sample_ddim_guided(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,src_im=None,tar=None,**kwargs):
-        b, *_, device = *x.shape, x.device
-        if 'test_model_kwargs' in kwargs:
-            kwargs=kwargs['test_model_kwargs']
-            x = torch.cat([x, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
-        elif 'rest' in kwargs:
-            x = torch.cat((x, kwargs['rest']), dim=1)
-        else:
-            raise Exception("kwargs must contain either 'test_model_kwargs' or 'rest' key")
-        
-        torch.set_grad_enabled(True)
-        x_in = x.detach().requires_grad_(True)
-        
-        
-        
-        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.apply_model(x_in, t, c)
-        else:  # check @ sanoojan
-            x_in_n = torch.cat([x_in] * 2) #x_in: 2,9,64,64
-            t_in = torch.cat([t] * 2)
-            c_in = torch.cat([unconditional_conditioning, c]) #c_in: 2,1,768
-            e_t_uncond, e_t = self.model.apply_model(x_in_n, t_in, c_in).chunk(2)
-            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond) #1,4,64,64
-
-        if score_corrector is not None:
-            assert self.model.parameterization == "eps"
-            e_t = score_corrector.modify_score(self.model, e_t, x_in, t, c, **corrector_kwargs)
-
-        
-
-
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-        # select parameters corresponding to the currently considered timestep
-        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
-        
-        Backward_guidance=True
-        # current prediction for x_0
-        
-        if Backward_guidance:
-            pred_x0 = (x_in[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            recons_image=self.model.differentiable_decode_first_stage(pred_x0)
-            recons_image=recons_image.detach().requires_grad_(True)
-            masks=1-TF.resize(x_in[:,8,:,:],(recons_image.shape[2],recons_image.shape[3]))
-            optimizer = torch.optim.Adam([recons_image], lr=5e-13)
-            
-            
-            weights = torch.ones_like(recons_image).cuda()
-            ones = torch.ones_like(recons_image).cuda()
-            zeros = torch.zeros_like(recons_image).cuda()
-            max_iters=2
-            for _ in range(max_iters):
-                with torch.no_grad():
-                    recons_image.clamp_(-1, 1)
-
-                optimizer.zero_grad()
-                # if operation_func != None:
-                #     op_im = operation_func(recons_image)
-                # else:
-                #     op_im = recons_image
-
-                # loss = criterion(op_im, operated_image)
-                src_im=TF.normalize(src_im, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-                ID_loss,_,seperate_sim=self.model.face_ID_model(recons_image,src_im,clip_img=False,return_seperate=True)
-                loss=1-torch.stack(seperate_sim,dim=0)
-                
-                
-                
-                src_mask  = (recons_image + 1) / 2
-                src_mask  = TF.resize(src_mask,(512,512))
-                src_mask  = TF.normalize(src_mask, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                targ_mask = (tar + 1) / 2
-                targ_mask  = TF.resize(targ_mask,(512,512))
-                targ_mask = TF.normalize(targ_mask, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                # breakpoint()
-                src_seg  = self.seg(self.spNorm(src_mask))[0]
-                # breakpoint()
-                src_seg = TF.resize(src_seg, (256, 256))
-                targ_seg = self.seg(self.spNorm(targ_mask))[0]
-                targ_seg = TF.resize(targ_seg, (256, 256))
-
-                # seg_loss = torch.tensor(0).to(self.model.device).float()
-
-                # Attributes = [0, 'background', 1 'skin', 2 'r_brow', 3 'l_brow', 4 'r_eye', 5 'l_eye', 6 'eye_g', 7 'l_ear', 8 'r_ear', 9 'ear_r', 10 'nose', 11 'mouth', 12 'u_lip', 13 'l_lip', 14 'neck', 15 'neck_l', 16 'cloth', 17 'hair', 18 'hat']
-                ids = [11, 12, 13]
-                seg_losses=[]
-                for im in range(recons_image.shape[0]):
-                    seg_loss = 0
-                    for id in ids:
-                        seg_loss+=(l1_loss(src_seg[im,id,:,:], targ_seg[im,id,:,:]))
-                    seg_losses.append(seg_loss)
-                loss+=torch.stack(seg_losses,dim=0)
-                # for id in ids:
-                #     seg_loss += l1_loss(src_seg[:,id,:,:], targ_seg[:,id,:,:])
-                    # seg_loss += mse_loss(src_seg[0,id,:,:], targ_seg[0,id,:,:])
-
-                # seg_loss * 200
-                
-                
-                
-                # breakpoint()
-                for __ in range(loss.shape[0]):
-                    if loss[__] < 0.00001:              #loss cutoff
-                        weights[__] = zeros[__]
-                    else:
-                        weights[__] = ones[__]
-
-                before_x = torch.clone(recons_image.data)
-
-
-                m_loss = loss.mean()
-                m_loss.backward()
-                
-                # breakpoint()
-                utils.clip_grad_norm_(recons_image, 0.01)
-                optimizer.step()
-
-                # if operation.lr_scheduler != None:
-                #     scheduler.step()
-                # breakpoint()
-                with torch.no_grad():
-                    recons_image.data = before_x * (1 - weights) + weights * recons_image.data
-
-                if weights.sum() == 0:
-                    break
-                
-            recons_image.requires_grad = False
-            torch.set_grad_enabled(False)
-
-            recons_image = torch.clamp(recons_image, -1, 1)
-            pred_x0_new = self.model.encode_first_stage(recons_image)
-            
-            pred_x0_new=self.model.get_first_stage_encoding(pred_x0_new)
-            # breakpoint()
-            e_t=(x[:,:4,:,:]- pred_x0_new*a_t.sqrt())/sqrt_one_minus_at
-            
-        else:
-            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            
-        if quantize_denoised:
-            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
-        # direction pointing to x_t
-        with torch.no_grad():
-            if Backward_guidance:
-                pred_x0=pred_x0_new
-            else:
-                pred_x0 = (x[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
-            dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-            noise = sigma_t * noise_like(dir_xt.shape, device, repeat_noise) * temperature
-            if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-            x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-            
-            
-            
-            del dir_xt,noise,x
-            #     x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-            # else:  
-            #     seperate_sim=3*torch.tensor(seperate_sim)
-            #     #make upper limit 1 and lower limit 0
-            #     seperate_sim=torch.clamp(seperate_sim,0,1)
-            #     x_prev = a_prev.sqrt() * pred_x0 + seperate_sim.view(-1,1,1,1).to(self.model.device)*dir_xt + noise
-            return x_prev, pred_x0
-    
-    @torch.no_grad()
-    def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
-                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,**kwargs):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,src_im=None,**kwargs):
         b, *_, device = *x.shape, x.device
         if 'test_model_kwargs' in kwargs:
             kwargs=kwargs['test_model_kwargs']
@@ -843,6 +529,81 @@ class DDIMSampler(object):
         # current prediction for x_0
         if x.shape[1]!=4:
             pred_x0 = (x[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
+            # G_id=ID_LOSS
+            seperate_sim=None
+            src_im=None
+            if src_im is not None:
+                pred_x0_im=self.model.decode_first_stage(pred_x0)
+                masks=1-TF.resize(x[:,8,:,:],(pred_x0_im.shape[2],pred_x0_im.shape[3]))
+                #mask x_samples_ddim
+                pred_x0_im_masked=pred_x0_im*masks.unsqueeze(1)
+                # x_samples_ddim_masked=un_norm_clip(x_samples_ddim_masked)
+                # x_samples_ddim_masked = TF.normalize(x_samples_ddim_masked, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+                
+                ID_loss,_,seperate_sim=self.model.face_ID_model(pred_x0_im_masked,src_im,clip_img=False,return_seperate=True)
+                grad=torch.autograd.grad(ID_loss,x)[0]
+        else:
+            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+            
+        if quantize_denoised:
+            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
+        # direction pointing to x_t
+        dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
+        noise = sigma_t * noise_like(dir_xt.shape, device, repeat_noise) * temperature
+        if noise_dropout > 0.:
+            noise = torch.nn.functional.dropout(noise, p=noise_dropout)
+        if seperate_sim is None:
+            x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        else:  
+            seperate_sim=3*torch.tensor(seperate_sim)
+            #make upper limit 1 and lower limit 0
+            seperate_sim=torch.clamp(seperate_sim,0,1)
+            x_prev = a_prev.sqrt() * pred_x0 + seperate_sim.view(-1,1,1,1).to(self.model.device)*dir_xt + noise
+        return x_prev, pred_x0
+    
+    @torch.no_grad()
+    def p_sample_ddim(self, x, c, t, index,repeat_noise=False, use_original_steps=False, quantize_denoised=False,
+                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,**kwargs):
+        b, *_, device = *x.shape, x.device
+        
+        if 'test_model_kwargs' in kwargs:
+            kwargs=kwargs['test_model_kwargs']
+            x = torch.cat([x, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
+        elif 'rest' in kwargs:
+            x = torch.cat((x, kwargs['rest']), dim=1)
+        else:
+            raise Exception("kwargs must contain either 'test_model_kwargs' or 'rest' key")
+        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+            e_t = self.model.apply_model(x, t, c)
+        else:  # check @ sanoojan
+            x_in = torch.cat([x] * 2) #x_in: 2,9,64,64
+            t_in = torch.cat([t] * 2)
+            # if self.model.stack_feat:
+            #     e_t_uncond=self.model.apply_model(x, t, unconditional_conditioning)
+            #     e_t = self.model.apply_model(x, t, c)
+            # else:
+            c_in = torch.cat([unconditional_conditioning, c]) #c_in: 2,1,768
+            e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond) #1,4,64,64
+
+        if score_corrector is not None:
+            assert self.model.parameterization == "eps"
+            e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
+
+        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
+        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
+        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
+        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
+        # select parameters corresponding to the currently considered timestep
+        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
+        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
+        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
+        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
+
+        # current prediction for x_0
+        if x.shape[1]!=4:
+            pred_x0 = (x[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
         else:
             pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
         if quantize_denoised:
@@ -854,6 +615,128 @@ class DDIMSampler(object):
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
         return x_prev, pred_x0
+    
+
+    
+    @torch.no_grad()
+    def p_sample_ddim_with_inverse(self, x, c, t, index, target_conditioning=None,
+                      inverse_results_dir=None,repeat_noise=False,src_start=None, use_original_steps=False, quantize_denoised=False,
+                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
+                      unconditional_guidance_scale=1.,flow=None, unconditional_conditioning=None,**kwargs):
+        b, *_, device = *x.shape, x.device
+        
+        ddim_inv_t = load_ddim_latents_at_t(t[0].item(), inverse_results_dir).to(x.device)
+        
+        
+        if 'test_model_kwargs' in kwargs:
+            kwargs=kwargs['test_model_kwargs']
+            x = torch.cat([x, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
+            if src_start is not None:
+                x_uncond = torch.cat([src_start, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
+            else:
+                x_uncond=x
+            ddim_inv_t = torch.cat([ddim_inv_t, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
+            
+        elif 'rest' in kwargs:
+            x = torch.cat((x, kwargs['rest']), dim=1)
+            if src_start is not None:
+                x_uncond = torch.cat([src_start, kwargs['rest']], dim=1)
+            else:
+                x_uncond = x
+            
+            ddim_inv_t = torch.cat((ddim_inv_t, kwargs['rest']), dim=1)
+        else:
+            raise Exception("kwargs must contain either 'test_model_kwargs' or 'rest' key")
+        if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
+            e_t = self.model.apply_model(x, t, c)
+            
+        else:  # check @ sanoojan
+            x_in = torch.cat([x,x_uncond]) #x_in: 2,9,64,64
+            x_in=torch.cat([x_in,ddim_inv_t],dim=0)
+            t_in = torch.cat([t] * 3)
+            # if self.model.stack_feat:
+            #     e_t_uncond=self.model.apply_model(x, t, unconditional_conditioning)
+            #     e_t = self.model.apply_model(x, t, c)
+            # else:
+            c_in = torch.cat([unconditional_conditioning, c]) #c_in: 2,1,768
+            c_in=torch.cat([c_in, target_conditioning],dim=0)
+            
+            e_t_uncond, e_t, e_t_recon = self.model.apply_model(x_in, t_in, c_in).chunk(3)
+            
+            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond) #1,4,64,64
+            e_t_recon = e_t_recon + unconditional_guidance_scale * (e_t_recon - e_t_uncond) #1,4,64,64
+
+        if score_corrector is not None:
+            assert self.model.parameterization == "eps"
+            e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
+            e_t_recon = score_corrector.modify_score(self.model, e_t_recon, x, t, c, **corrector_kwargs)
+
+        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
+        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
+        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
+        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
+        # select parameters corresponding to the currently considered timestep
+        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
+        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
+        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
+        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
+
+        # current prediction for x_0
+        if x.shape[1]!=4:
+            pred_x0 = (x[:,:4,:,:] - sqrt_one_minus_at * e_t) / a_t.sqrt()
+            pred_x0_recon = (ddim_inv_t[:,:4,:,:] - sqrt_one_minus_at * e_t_recon) / a_t.sqrt()
+            
+        else:
+            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+            pred_x0_recon = (ddim_inv_t - sqrt_one_minus_at * e_t_recon) / a_t.sqrt()   
+        if quantize_denoised:
+            pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
+            pred_x0_recon, _, *_ = self.model.first_stage_model.quantize(pred_x0_recon)
+        # direction pointing to x_t
+        dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
+        noise = sigma_t * noise_like(dir_xt.shape, device, repeat_noise) * temperature
+        if noise_dropout > 0.:
+            noise = torch.nn.functional.dropout(noise, p=noise_dropout)
+        x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        
+        
+        dir_xt_recon = (1. - a_prev - sigma_t**2).sqrt() * e_t_recon
+        noise_recon = sigma_t * noise_like(dir_xt_recon.shape, device, repeat_noise) * temperature
+        if noise_dropout > 0.:  
+            noise_recon = torch.nn.functional.dropout(noise_recon, p=noise_dropout)
+        x_prev_recon = a_prev.sqrt() * pred_x0_recon + dir_xt_recon + noise_recon
+        
+        # if t[0].item()>130 and t[0].item()<150:
+        #     print(t)
+            
+        #     # x_prev= align_by_flow(x_prev=x_prev,flow=flow,alpha=0.5)
+        #     x_prev= align_by_flow_high_res(x_prev=x_prev,flow=flow,decode_fn=self.model.decode_first_stage,
+        #                                   encode_fn= self.model.encode_first_stage,
+        #                                   first_stage_fn=self.model.get_first_stage_encoding,
+        #                                   alpha=0.5)
+            
+            
+            # x_prev = batch_flow_align(
+            #     x_prev=x_prev,
+            #     x_prev_recon=x_prev_recon,
+            #     decode_fn=self.model.decode_first_stage,# or appropriate decoder
+            #     encode_fn= self.model.encode_first_stage,
+            #     first_stage_fn=self.model.get_first_stage_encoding,
+            #     alpha=0.0  # control temporal smoothing
+            # )
+            
+            # x_prev = batch_flow_align_latent(
+            #     x_prev=x_prev,
+            #     x_prev_recon=x_prev_recon,
+            #     decode_fn=self.model.decode_first_stage,# or appropriate decoder
+            #     encode_fn= self.model.encode_first_stage,
+            #     first_stage_fn=self.model.get_first_stage_encoding,
+            #     alpha=0.0  # control temporal smoothing
+            # )
+        
+        
+        return x_prev, pred_x0
+    
     
     
     def sample_train(self,
@@ -895,7 +778,8 @@ class DDIMSampler(object):
         C, H, W = shape
         size = (batch_size, C, H, W)
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
-
+        # for param in self.model.first_stage_model.parameters():
+        #     param.requires_grad = False
         samples, intermediates = self.ddim_sampling_train(conditioning, size,
                                                     callback=callback,
                                                     img_callback=img_callback,
@@ -996,7 +880,7 @@ class DDIMSampler(object):
 
         return img, intermediates
 
-    @torch.no_grad()
+    
     def p_sample_ddim_train(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,return_features=False,**kwargs):
@@ -1081,7 +965,7 @@ class DDIMSampler(object):
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((x_latent.shape[0],), step, device=x_latent.device, dtype=torch.long)
-            x_dec, _ = self.p_sample_ddim_guided(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
+            x_dec, _ = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
                                           unconditional_guidance_scale=unconditional_guidance_scale,
                                           unconditional_conditioning=unconditional_conditioning)
         return x_dec
