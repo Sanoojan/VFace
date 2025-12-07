@@ -686,13 +686,6 @@ def main():
         help="path to data config",
     )
 
-    # parser.add_argument(
-    #     "--outdir",
-    #     type=str,
-    #     nargs="?",
-    #     help="dir to write results to",
-    #     default="results_video_new/debug"
-    # )
     parser.add_argument(
         "--Base_dir",
         type=str,
@@ -810,18 +803,6 @@ def main():
         default=3.0,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
-    # parser.add_argument(
-    #     "--target_video",
-    #     type=str,
-    #     help="target_video",
-    #     default="/egr/research-sprintai/baliahsa/mbz-back/Video_diffusion/AnyV2V/data/Data/VFHQ-Test/GT/Vid_Interval1_512x512_LANCZOS4/Clip+-1Jouc19Ixo+P0+C1+F4196-4320/vid.mp4",
-    # )
-    # parser.add_argument(
-    #     "--src_image",
-    #     type=str,
-    #     help="src_image",
-    #     default="/egr/research-sprintai/baliahsa/mbz-back/Video_diffusion/AnyV2V/data/Data/VFHQ-Test/Celeb_Source/10.jpg"
-    # )
     parser.add_argument(
         "--src_image_mask",
         type=str,
