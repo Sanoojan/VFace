@@ -46,15 +46,16 @@ sh REFace/VFace_video_swap_batch.sh
 
 
 ## Citing Us
-If you find our work valuable, we kindly ask you to consider citing our paper and starring ⭐ our repository. Our implementation includes a standard metric code and we hope it make life easier for the generation research community.
+If you find our work valuable, we kindly ask you to consider citing our paper and starring ⭐ our repository. 
 
 
 ```
-@article{baliah2024realistic,
-  title={Realistic and Efficient Face Swapping: A Unified Approach with Diffusion Models},
-  author={Baliah, Sanoojan and Lin, Qinliang and Liao, Shengcai and Liang, Xiaodan and Khan, Muhammad Haris},
-  journal={arXiv preprint arXiv:2409.07269},
-  year={2024}
+@inproceedings{baliah2026vface,
+  title={VFace: A Training-Free Approach for Diffusion-Based Video Face Swapping},
+  author={Baliah, Sanoojan and Abeysinghe, Yohan and Thushara, Rusiru and Muhammad, Khan and Dhall, Abhinav and Nandakumar, Karthik and Khan, Muhammad Haris},
+  booktitle={Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision},
+  pages={4315--4324},
+  year={2026}
 }
 ```
 
