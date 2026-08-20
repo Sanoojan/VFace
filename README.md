@@ -21,7 +21,7 @@ The commands below are self-contained; you do not need to clone or configure ano
 ### 1. Prerequisites
 
 - Linux
-- An NVIDIA GPU and a CUDA installation compatible with PyTorch 1.13.1/CUDA 11.7
+- An NVIDIA GPU and a compatible CUDA installation 
 - [Conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/)
 - Git
 - FFmpeg available on `PATH`
